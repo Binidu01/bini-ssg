@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+pnpm workspace.yaml
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Temp files
+*.tmp
+*.temp
+EOF

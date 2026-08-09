@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "types": ["node"],
+    "noImplicitAny": false,
+    "allowSyntheticDefaultImports": true,
+    "ignoreDeprecations": "6.0"  // Add this line
+    // Remove "paths" if you have it
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

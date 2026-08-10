@@ -21,8 +21,8 @@ No dev-server behavior change, no separate CLI — it's a Vite build plugin that
 
 1. Reads your route list from `bini-router`'s `generateRouteManifest()` (a **required** peer dependency — there is no fallback route scanner).
 2. Loads `src/main.{tsx,jsx,ts,js}` directly in Node (via `tsx`, also required) and expects it to export a `render(url)` function.
-3. Calls `render(route)` for every discovered static route, plus a **shell page** for every dynamic route pattern (see [How routes are discovered](#how-routes-are-discovered)).
-4. Injects the returned HTML string into the `#root` div of your already-built `<outDir>/index.html` (so the pre-rendered pages keep the real, hashed CSS/JS `<link>`/`<script>` tags Vite generated).
+3. Calls `render(route)` for **every** discovered route — static routes and, internally, the shell route generated for each dynamic route pattern too (see [How routes are discovered](#how-routes-are-discovered)) — though for shell routes the returned HTML is discarded rather than written out.
+4. For non-shell routes, injects the returned HTML string into the `#root` div of your already-built `<outDir>/index.html` (so the pre-rendered pages keep the real, hashed CSS/JS `<link>`/`<script>` tags Vite generated).
 5. Writes one `index.html` per route into your output directory, deduplicating any overlapping route paths first.
 
 This gets you static, crawlable HTML per route (good for SEO and first paint) while still shipping a normal client-side React app that hydrates/takes over after load.
@@ -80,7 +80,7 @@ export function render(url: string): Promise<string> | string
 ```
 
 - `url` is the route path being pre-rendered (e.g. `/`, `/about`, `/blog/hello-world`).
-- The return value (or resolved value, if a `Promise`) must be an HTML string — this is inserted directly into `<div id="root">...</div>` in the output file.
+- The return value (or resolved value, if a `Promise`) must be an HTML string — this is inserted directly into `<div id="root">...</div>` in the output file for static routes. For dynamic-pattern shell routes, `render()` is still invoked (see below) but its return value is thrown away.
 
 A typical implementation uses `react-dom/server` and React Router's `StaticRouter` around your existing `App`:
 
@@ -106,11 +106,11 @@ export async function render(url: string): Promise<string> {
 }
 ```
 
-> This file runs in two different environments: the browser (for the `createRoot(...).render(...)` call) and Node, via `tsx`, for the `render()` export (called only by `bini-ssg`, never shipped to the client). Keep anything browser-only (e.g. `window`/`document` access outside of the mount call) out of the code path `render()` actually executes, since it runs before any DOM exists.
+> This file runs in two different environments: the browser (for the `createRoot(...).render(...)` call) and Node, via `tsx`, for the `render()` export (called by `bini-ssg` for every route it processes — static and shell alike — never shipped to the client). Keep anything browser-only (e.g. `window`/`document` access outside of the mount call) out of the code path `render()` actually executes, since it runs before any DOM exists.
 
 ### Why this matters for correctness
 
-`render()` is called once per route, and by default (see `concurrency` below) sequentially in the *same* Node process and the *same* loaded module. If your app (or a library it uses) keeps state at module scope — a store created outside a component, an in-memory cache, a module-level counter — that state persists and can leak between routes. Keep `render()`'s output a pure function of the `url` argument wherever possible.
+`render()` is called once per route — including dynamic-pattern shell routes, whose output is simply discarded afterward — and by default (see `concurrency` below) sequentially in the *same* Node process and the *same* loaded module. If your app (or a library it uses) keeps state at module scope — a store created outside a component, an in-memory cache, a module-level counter — that state persists and can leak between routes. Keep `render()`'s output a pure function of the `url` argument wherever possible, and be aware that side effects in `render()` (logging, writes, throwing on unexpected input) will fire for shell routes too, even though their HTML is never used.
 
 ---
 
@@ -138,9 +138,9 @@ const manifest = generateRouteManifest(appDir)
   /docs/[...slug]/index.html
   ```
 
-  A shell page is just your built `<outDir>/index.html` template as-is (`render()` is **not** called for it) — the idea being your client app takes over and fetches/renders the real content once it hydrates, so the route at least resolves to a real file for static hosts instead of 404ing.
+  A shell page's output is just your built `<outDir>/index.html` template as-is — the idea being your client app takes over and fetches/renders the real content once it hydrates, so the route at least resolves to a real file for static hosts instead of 404ing. Note that `render(route)` is still **called** internally for each shell route (it runs through the same code path and the same `concurrency` limit as a fully-rendered route); only its returned HTML is discarded rather than written out.
 
-  If you want a *fully* pre-rendered (not shell) page for a specific dynamic URL, pass it explicitly via the `routes` option — any route you provide there that matches a dynamic pattern is rendered through `render()` normally instead of getting a shell, and no shell is generated for that pattern.
+  There is currently no option to fully pre-render a specific dynamic URL (e.g. get real HTML for `/blog/hello-world` instead of a shell) — every route matching a `manifest.dynamic` pattern always gets a shell page.
 
 If `bini-router` can't be loaded or its manifest generation throws (e.g. a real `RouteConflictError`/`CircularLayoutError` from bini-router itself), `bini-ssg` fails the build by default — see `failOnError`.
 
@@ -152,18 +152,17 @@ If `bini-router` can't be loaded or its manifest generation throws (e.g. a real 
 biniSSG({
   appDir      : 'src/app',   // Passed to bini-router's generateRouteManifest. Default: 'src/app'
   outputDir   : undefined,   // Where to write pre-rendered HTML. Default: your Vite build.outDir (usually 'dist')
-  routes      : [],          // Deprecated. Explicit URLs to fully pre-render for a dynamic route pattern,
-                              //   instead of getting the default shell page. e.g. ['/blog/hello-world'].
-                              //   Logs a deprecation warning if used — dynamic routes now get a
-                              //   client-hydrated shell automatically without this.
   includeRoot : true,        // Ensure '/' is pre-rendered even if it wasn't discovered or otherwise
                               //   included in the route list. Set false to disable this fallback.
   fallback    : false,       // Also render '/404' and write it to '<outDir>/404.html', for hosts that
                               //   serve a static 404 page (e.g. Netlify, GitHub Pages). Skipped if a
                               //   '/404' or '/not-found' static route already exists.
   concurrency : 1,           // How many routes to render in parallel. Default: 1 (fully sequential).
-                              //   Only raise this if render() and everything it touches has no shared
-                              //   mutable module-level state — see "Why this matters for correctness" above.
+                              //   Applies to every route bini-ssg processes, including dynamic-pattern
+                              //   shells — render() is invoked for those too, just with its output
+                              //   discarded. Only raise this if render() and everything it touches has
+                              //   no shared mutable module-level state — see "Why this matters for
+                              //   correctness" above.
   failOnError : true,        // Throw (failing `vite build`) if route discovery fails, the app module
                               //   can't be loaded, or any route fails to render. Default: true.
   verbose     : true,        // Print per-route progress and discovery details. Default: true.
@@ -171,21 +170,17 @@ biniSSG({
 })
 ```
 
-### `routes` (deprecated)
-
-Kept for backward compatibility. Originally the only way to handle dynamic routes; now that `bini-ssg` auto-generates shell pages for every dynamic pattern, you only need `routes` if you want a specific dynamic URL to be **fully** server-rendered (via your `render()` function) rather than shipped as a client-hydrated shell. Using this option logs a deprecation warning; it isn't going away, but the shell-based default should cover most cases without it.
-
 ### `includeRoot`
 
-Defaults to `true`. After static, shell, and user-provided routes are collected, `bini-ssg` checks whether `/` is anywhere in that list — if not, it's added. This runs regardless of how many other routes exist; it's not just a fallback for an otherwise-empty route list. Set to `false` if you genuinely don't want a pre-rendered home page (e.g. `/` is itself a dynamic/shell route you're handling another way).
+Defaults to `true`. After static and shell routes are collected, `bini-ssg` checks whether `/` is anywhere in that list — if not, it's added. This runs regardless of how many other routes exist; it's not just a fallback for an otherwise-empty route list. Set to `false` if you genuinely don't want a pre-rendered home page (e.g. `/` is itself a dynamic/shell route you're handling another way).
 
 ### `failOnError`
 
-Defaults to `true`. When something goes wrong — `bini-router`'s manifest can't be generated, `src/main.*` can't be found or doesn't export `render`, or any individual route (static or explicit) fails during rendering — `bini-ssg` throws at the end of `closeBundle`, which makes `vite build` exit non-zero. This is deliberate: a CI pipeline should fail loudly on a broken or partially-rendered site rather than silently shipping it. Set `failOnError: false` only if you specifically want the plain client-side bundle to still ship when pre-rendering fails (failures are still logged either way).
+Defaults to `true`. When something goes wrong — `bini-router`'s manifest can't be generated, `src/main.*` can't be found or doesn't export `render`, or any individual route fails during rendering — `bini-ssg` throws at the end of `closeBundle`, which makes `vite build` exit non-zero. This is deliberate: a CI pipeline should fail loudly on a broken or partially-rendered site rather than silently shipping it. Set `failOnError: false` only if you specifically want the plain client-side bundle to still ship when pre-rendering fails (failures are still logged either way).
 
 ### `concurrency`
 
-Defaults to `1` — routes render one at a time, in order, in the same Node process. This is the safe default because `render()` runs against a single loaded copy of your app module; anything with shared mutable state at module scope (stores, caches, counters) can behave inconsistently if multiple routes render at once. Raise `concurrency` for faster builds only once you've confirmed `render()` has no such shared state — rendering is parallelized internally via [`p-limit`](https://www.npmjs.com/package/p-limit). Shell pages don't call `render()` at all, so they're unaffected by this setting either way.
+Defaults to `1` — routes render one at a time, in order, in the same Node process. This is the safe default because `render()` runs against a single loaded copy of your app module; anything with shared mutable state at module scope (stores, caches, counters) can behave inconsistently if multiple routes render at once. This applies to shell routes exactly as much as static ones, since `render()` is called for both. Raise `concurrency` for faster builds only once you've confirmed `render()` has no such shared state — rendering is parallelized internally via [`p-limit`](https://www.npmjs.com/package/p-limit).
 
 ---
 
@@ -196,7 +191,7 @@ Defaults to `1` — routes render one at a time, in order, in the same Node proc
 - If it finds a tag matching `<div id="root" ...>` (with any other attributes, including a self-closing `<div id="root" />`), its contents are replaced with your rendered HTML.
 - If no such div exists, the rendered HTML is injected as a new `<div id="root">` immediately after the opening `<body>` tag.
 - If neither a `#root` div nor a `<body>` tag can be found in the template, the output file falls back to being just the bare `<div id="root">...</div>` fragment — with no surrounding `<html>`/`<head>`/`<body>`. This only happens if your `index.html` is missing or malformed; a normal Vite + React project won't hit this path.
-- Shell pages skip this merge step entirely — the template is used as-is (a root div is injected only if one isn't already present), since there's no rendered HTML to insert.
+- Shell pages skip this merge step — the template is used as-is (a root div is injected only if one isn't already present). `render()` is still called for these routes beforehand (see [How routes are discovered](#how-routes-are-discovered)); its returned HTML is simply never inserted anywhere.
 
 Matching the end of the `#root` div uses tag-depth counting rather than a naive first-match, so nested `<div>`s inside your rendered content (including nested self-closing ones) don't cause the wrong closing tag to be picked. This isn't a full HTML parser, though — a literal `</div>` appearing inside a `<script>` block in your rendered output is a known edge case that can throw off the match; this doesn't come up in normal React output.
 
@@ -212,18 +207,16 @@ dist/
   about/
     index.html                  ← pre-rendered /about (static route)
   blog/
-    hello-world/
-      index.html                 ← fully pre-rendered /blog/hello-world (from explicit `routes`)
     [slug]/
-      index.html                 ← shell page for /blog/:slug (client-hydrated, no render() call)
+      index.html                 ← shell page for /blog/:slug (template used as-is; render() ran but its output was discarded)
   docs/
     [...slug]/
-      index.html                 ← shell page for /docs/* (client-hydrated, no render() call)
+      index.html                 ← shell page for /docs/* (template used as-is; render() ran but its output was discarded)
   404.html                      ← only written if `fallback: true`
   assets/                        ← your normal Vite JS/CSS output, unchanged
 ```
 
-Routes are deduplicated before writing, so an explicit `routes` entry that happens to match an already-discovered static route won't be rendered or written twice.
+Routes are deduplicated before writing, so a route that could otherwise end up in the list twice (e.g. `/` matched by discovery and again by the `includeRoot` fallback) is only rendered and written once.
 
 ---
 
@@ -243,7 +236,8 @@ You don't need to configure any of this — it's an internal implementation deta
 ## Limitations
 
 - **No dev-server preview of pre-rendered output.** `apply: 'build'` means this plugin does nothing under `vite dev`; you'll only see pre-rendered HTML by running `vite build` (and optionally `vite preview` afterward to serve the `dist` output).
-- **Dynamic routes get a shell, not full pre-rendering, by default.** There's no automatic enumeration of `[id]`/`[...slug]` param values (e.g. from a CMS or database) — for a specific dynamic URL to be fully pre-rendered through `render()`, pass it explicitly via the (deprecated) `routes` option.
+- **Dynamic routes always get a shell, never full pre-rendering.** There's no automatic enumeration of `[id]`/`[...slug]` param values (e.g. from a CMS or database), and there's no option to opt a specific dynamic URL into full pre-rendering — every route matching a `manifest.dynamic` pattern gets a shell page, full stop.
+- **`render()` still runs for shell routes.** The call happens and is awaited exactly like for a static route; only its returned HTML is discarded. Side effects in `render()` (logging, writes, throwing on unexpected input) will still occur for shell routes, not just fully-rendered ones.
 - **`render()` is your responsibility.** `bini-ssg` doesn't wire up server rendering for you — see [Your `render()` function](#your-render-function).
 - **`bini-router` is required, not optional.** There's no fallback file-system route scanner; if `bini-router` can't be resolved or its manifest throws, the build fails (when `failOnError: true`, the default).
 - **Root-div replacement is regex/depth-based, not a full HTML parser.** Handles nested and self-closing `<div>`s correctly; a literal `</div>` inside a `<script>` block in your rendered output is the one known case that can produce incorrect output.

@@ -1,6 +1,6 @@
 {
   "name": "bini-ssg",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "True SSG for Bini.js with zero code changes — pre-renders all routes to static HTML during vite build",
   "type": "module",
   "main": "dist/index.js",
@@ -51,7 +51,7 @@
     "p-limit": "^7.0.0"
   },
   "peerDependencies": {
-    "bini-router": "^2.0.2",
+    "bini-router": "2.0.4",
     "tsx": "^4.0.0",
     "react": ">=18",
     "react-dom": ">=18",

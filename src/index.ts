@@ -39,7 +39,6 @@ export interface SSGOptions {
   quiet?: boolean
   failOnError?: boolean
   concurrency?: number
-  routes?: string[] // Deprecated
 }
 
 interface RouteTree {
@@ -61,10 +60,6 @@ let loaderHooksRegistered = false
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
-function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 function getMaxRouteLength(routes: string[]): number {
   let max = 10
   for (const route of routes) {
@@ -79,22 +74,12 @@ function deduplicateRoutes(routes: string[]): string[] {
 
 /**
  * Safely replace the content inside <div id="root"> using depth counting.
- * 
- * Note: This is a best-effort approach that handles well-formed HTML.
- * It may not work correctly if the HTML contains:
- * - </div> inside <script> tags or text content
- * - Self-closing div tags nested inside the root (handled)
- * - Custom elements starting with "div" (<divider>)
- * 
- * For production-grade parsing, use a proper HTML parser like 'parse5' or 'cheerio'.
  */
 function safeRootDivReplacement(template: string, content: string): string {
-  // Find the root div opening tag
   const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
   const match = template.match(rootDivRegex)
   
   if (!match) {
-    // No root div found, inject one
     const bodyRegex = /<body[^>]*>/
     if (bodyRegex.test(template)) {
       return template.replace(bodyRegex, (match) => {
@@ -104,16 +89,12 @@ function safeRootDivReplacement(template: string, content: string): string {
     return `<div id="root">${content}</div>`
   }
   
-  // If match.index is undefined, fallback to simple replacement
   if (match.index === undefined) {
     return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
   }
   
-  // Check if this is a self-closing div
   const tagMatch = match[0]
   if (tagMatch.endsWith('/>')) {
-    // Self-closing div - replace the whole tag with a proper opening div
-    // and inject content after it
     const before = template.slice(0, match.index)
     const after = template.slice(match.index + tagMatch.length)
     return `${before}<div id="root">${content}</div>${after}`
@@ -125,13 +106,9 @@ function safeRootDivReplacement(template: string, content: string): string {
   
   for (let i = startIndex; i < template.length; i++) {
     if (template[i] === '<') {
-      // Check for opening div tag with word boundary check
       if (template.slice(i, i + 4) === '<div') {
         const nextChar = template[i + 4] || ''
-        // Only count it as a div if it's followed by whitespace, >, or /
         if (/[\s/>]/.test(nextChar)) {
-          // Check if this is a self-closing tag
-          // Look ahead to find the closing > and check for />
           let j = i + 4
           let isSelfClosing = false
           while (j < template.length && template[j] !== '>') {
@@ -141,7 +118,6 @@ function safeRootDivReplacement(template: string, content: string): string {
             }
             j++
           }
-          // Only increment depth if it's NOT self-closing
           if (!isSelfClosing) {
             depth++
           }
@@ -156,13 +132,28 @@ function safeRootDivReplacement(template: string, content: string): string {
     }
   }
   
-  // If we never found the closing tag (edge case), fallback to simple replacement
   if (endIndex === startIndex) {
     return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
   }
   
-  // Replace the root div content
   return template.slice(0, startIndex) + content + template.slice(endIndex)
+}
+
+// ─── Route manifest from bini-router ───────────────────────────────────────
+
+async function getBiniRouterAPI() {
+  const biniRouter = await import('bini-router')
+  return {
+    generateRouteManifest: biniRouter.generateRouteManifest,
+  }
+}
+
+function patternToShellRoute(pattern: string): string {
+  return pattern
+    .replace(/\/:([^/]+)/g, (match, param) => {
+      return `/[${param}]`
+    })
+    .replace(/\/\*/g, '/[...slug]')
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -202,8 +193,14 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
       }
       
       try {
-        const manifestResult = await getRoutesFromManifest(appDir)
-        routeTree = manifestResult
+        const { generateRouteManifest } = await getBiniRouterAPI()
+        
+        const manifest = generateRouteManifest(path.join(process.cwd(), appDir))
+        routeTree = {
+          static: manifest.static || [],
+          dynamic: manifest.dynamic || [],
+          metadata: manifest.metadata || {},
+        }
         
         if (!quiet && verbose) {
           const total = routeTree.static.length + routeTree.dynamic.length
@@ -236,45 +233,27 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
       if (routeTree.dynamic.length > 0 && !quiet && verbose) {
         log.detail(`Auto-generating shells for ${routeTree.dynamic.length} dynamic route(s)`)
       }
-      
-      if (options.routes && options.routes.length > 0) {
-        log.warn('The "routes" option is deprecated. Dynamic routes are now auto-discovered.')
-        log.detail('Please remove the "routes" option from your biniSSG config.')
-      }
     },
 
     async closeBundle() {
-      // Note: This plugin uses 'apply: build' so closeBundle only runs once per build.
-      // In Vite's build mode, closeBundle is called once after the build completes.
-      // No risk of multiple loader hooks accumulating in watch mode.
-
       if (!quiet && verbose) {
         log.step('Pre-rendering static routes')
       }
 
       let allRoutes: string[] = []
 
+      // Add static routes
       allRoutes.push(...routeTree.static)
 
-      if (options.routes) {
-        allRoutes.push(...options.routes)
-      }
-
-      const userProvidedDynamicRoutes = new Set(options.routes || [])
+      // Generate shells for dynamic routes
       const dynamicShellRoutes: string[] = []
-      
       for (const dynamicPattern of routeTree.dynamic) {
-        const hasUserProvided = Array.from(userProvidedDynamicRoutes).some(route => 
-          matchesPattern(route, dynamicPattern)
-        )
-        
-        if (!hasUserProvided) {
-          const shellRoute = patternToShellRoute(dynamicPattern)
-          dynamicShellRoutes.push(shellRoute)
-          allRoutes.push(shellRoute)
-        }
+        const shellRoute = patternToShellRoute(dynamicPattern)
+        dynamicShellRoutes.push(shellRoute)
+        allRoutes.push(shellRoute)
       }
 
+      // Add root route if not included
       if (includeRoot && !allRoutes.includes('/')) {
         allRoutes.unshift('/')
       }
@@ -294,7 +273,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         log.info(`Rendering ${colors.cyan}${allRoutes.length}${colors.reset} routes to ${colors.cyan}${outDir}${colors.reset}`)
         if (totalStatic > 0) log.detail(`  Static routes: ${totalStatic}`)
         if (totalShells > 0) log.detail(`  Shell routes: ${totalShells}`)
-        if (options.routes?.length) log.detail(`  User-provided: ${options.routes.length}`)
         if (concurrency === 1) {
           log.detail(`  Rendering: sequential (safe mode)`)
         } else {
@@ -413,53 +391,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
   }
 }
 
-// ─── Route discovery ────────────────────────────────────────────────────────
-
-async function getRoutesFromManifest(appDir: string): Promise<RouteTree> {
-  try {
-    const { generateRouteManifest } = await import('bini-router')
-    const manifest = generateRouteManifest(appDir)
-    return {
-      static: manifest.static || [],
-      dynamic: manifest.dynamic || [],
-      metadata: manifest.metadata || {},
-    }
-  } catch (error) {
-    if (error instanceof Error) {
-      throw error
-    }
-    throw new Error(String(error))
-  }
-}
-
-// ─── Pattern matching utilities ─────────────────────────────────────────────
-
-function matchesPattern(route: string, pattern: string): boolean {
-  const escapedPattern = pattern
-    .split('/')
-    .map(segment => {
-      if (segment.startsWith(':')) {
-        return '[^/]+'
-      }
-      if (segment === '*') {
-        return '.*'
-      }
-      return escapeRegExp(segment)
-    })
-    .join('/')
-  
-  const regex = new RegExp(`^${escapedPattern}$`)
-  return regex.test(route)
-}
-
-function patternToShellRoute(pattern: string): string {
-  return pattern
-    .replace(/\/:([^/]+)/g, (match, param) => {
-      return `/[${param}]`
-    })
-    .replace(/\/\*/g, '/[...slug]')
-}
-
 // ─── Asset-stub loader ──────────────────────────────────────────────────────
 
 const STYLE_EXTS = ['.css', '.scss', '.sass', '.less', '.styl']
@@ -523,7 +454,6 @@ export async function load(url, context, nextLoad) {
 }
 
 async function registerAssetStubLoader(): Promise<void> {
-  // Only register once per process lifetime
   if (loaderHooksRegistered) return
   if (assetStubLoaderRegistered) return
   
@@ -548,8 +478,6 @@ async function cleanupAssetStubLoader(): Promise<void> {
       // Ignore cleanup errors
     }
     assetStubLoaderPath = null
-    // Don't reset loaderHooksRegistered - hooks can't be unregistered
-    // But reset this flag so we know the file is cleaned up
     assetStubLoaderRegistered = false
   }
 }
@@ -658,3 +586,5 @@ function renderRoute(
     return safeRootDivReplacement(template, html)
   })
 }
+
+export default biniSSG

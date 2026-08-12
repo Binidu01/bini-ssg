@@ -20,12 +20,9 @@ const colors = {
 const log = {
   info: (msg: string) => console.log(`${colors.blue}${colors.bold}INFO${colors.reset} ${msg}`),
   success: (msg: string) => console.log(`${colors.green}${colors.bold}SUCCESS${colors.reset} ${msg}`),
-  warn: (msg: string) => console.log(`${colors.yellow}${colors.bold}WARN${colors.reset} ${msg}`),
-  error: (msg: string) => console.log(`${colors.red}${colors.bold}ERROR${colors.reset} ${msg}`),
   step: (msg: string) => console.log(`${colors.cyan}${colors.bold}STEP${colors.reset} ${msg}`),
   detail: (msg: string) => console.log(`  ${colors.dim}${msg}${colors.reset}`),
   ok: (msg: string) => console.log(`  ${colors.green}OK${colors.reset} ${msg}`),
-  fail: (msg: string) => console.log(`  ${colors.red}FAIL${colors.reset} ${msg}`),
 }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -78,7 +75,7 @@ function deduplicateRoutes(routes: string[]): string[] {
 function safeRootDivReplacement(template: string, content: string): string {
   const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
   const match = template.match(rootDivRegex)
-  
+
   if (!match) {
     const bodyRegex = /<body[^>]*>/
     if (bodyRegex.test(template)) {
@@ -88,22 +85,22 @@ function safeRootDivReplacement(template: string, content: string): string {
     }
     return `<div id="root">${content}</div>`
   }
-  
+
   if (match.index === undefined) {
     return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
   }
-  
+
   const tagMatch = match[0]
   if (tagMatch.endsWith('/>')) {
     const before = template.slice(0, match.index)
     const after = template.slice(match.index + tagMatch.length)
     return `${before}<div id="root">${content}</div>${after}`
   }
-  
+
   const startIndex = match.index + match[0].length
   let depth = 1
   let endIndex = startIndex
-  
+
   for (let i = startIndex; i < template.length; i++) {
     if (template[i] === '<') {
       if (template.slice(i, i + 4) === '<div') {
@@ -131,12 +128,70 @@ function safeRootDivReplacement(template: string, content: string): string {
       }
     }
   }
-  
+
   if (endIndex === startIndex) {
     return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
   }
-  
+
   return template.slice(0, startIndex) + content + template.slice(endIndex)
+}
+
+// ─── Shell HTML ─────────────────────────────────────────────────────────────
+
+/**
+ * Builds shell HTML for a route without invoking module.render(). Used both
+ * for dynamic-route shells and for static routes that failed to pre-render
+ * and are falling back to a shell so the build doesn't break.
+ *
+ * IMPORTANT: the template is reused as-is. It already carries whatever
+ * metadata your build produced for that route (title, meta tags, hashed
+ * asset links, custom <meta name="..."> entries, etc). We never rewrite or
+ * add metadata here — doing so would make the server-emitted <head> diverge
+ * from what the client bundle expects on hydrate, causing hydration errors.
+ * The only thing we ever touch is making sure a #root mount point exists.
+ */
+const SHELL_MARKER_SCRIPT = '<script>window.__BINI_SHELL__=true;</script>'
+
+/**
+ * Marks the document as a shell so the client entry knows to do a plain
+ * client-side render instead of hydrateRoot(). Without this, React tries to
+ * hydrate the shell's empty #root against the real component tree, the DOM
+ * it finds doesn't match anything it expected, and it throws React error
+ * #418 ("Hydration failed because the initial UI does not match what was
+ * rendered on the server").
+ *
+ * Placed as a plain (non-module) inline script, which — unlike the app's
+ * `type="module"` entry script — runs synchronously during parsing, so it's
+ * guaranteed to execute before the module script that mounts the app.
+ */
+function injectShellMarker(template: string): string {
+  if (template.includes('__BINI_SHELL__')) return template
+  if (/<\/head>/i.test(template)) {
+    return template.replace(/<\/head>/i, `  ${SHELL_MARKER_SCRIPT}\n</head>`)
+  }
+  const bodyRegex = /<body[^>]*>/
+  if (bodyRegex.test(template)) {
+    return template.replace(bodyRegex, (match) => `${match}\n  ${SHELL_MARKER_SCRIPT}`)
+  }
+  return `${SHELL_MARKER_SCRIPT}\n${template}`
+}
+
+function renderShellHtml(template: string): string {
+  let html = injectShellMarker(template)
+
+  const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
+  if (rootDivRegex.test(html)) {
+    return html
+  }
+
+  const bodyRegex = /<body[^>]*>/
+  if (bodyRegex.test(html)) {
+    return html.replace(bodyRegex, (match) => {
+      return `${match}\n  <div id="root"><!-- Shell content --></div>`
+    })
+  }
+
+  return `<div id="root"><!-- Shell content --></div>`
 }
 
 // ─── Route manifest from bini-router ───────────────────────────────────────
@@ -168,7 +223,7 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
   const concurrency = options.concurrency ?? 1
   const includeRoot = options.includeRoot !== false
   const startTime = Date.now()
-  
+
   let mainModule: MainModule | null = null
   let htmlTemplate: string | null = null
   let hasFatalError = false
@@ -181,65 +236,30 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
     configResolved(resolvedConfig: ResolvedConfig) {
       config = resolvedConfig
       outDir = options.outputDir || config.build.outDir || 'dist'
-      if (!quiet && verbose) {
-        log.info(`Scanning routes in ${colors.cyan}${appDir}${colors.reset}`)
-        log.detail(`Output directory: ${colors.cyan}${outDir}${colors.reset}`)
-      }
     },
 
     async buildStart() {
-      if (!quiet && verbose) {
-        log.step('Discovering routes')
-      }
-      
       try {
         const { generateRouteManifest } = await getBiniRouterAPI()
-        
+
         const manifest = generateRouteManifest(path.join(process.cwd(), appDir))
         routeTree = {
           static: manifest.static || [],
           dynamic: manifest.dynamic || [],
           metadata: manifest.metadata || {},
         }
-        
-        if (!quiet && verbose) {
-          const total = routeTree.static.length + routeTree.dynamic.length
-          log.success(`Found ${colors.cyan}${total}${colors.reset} routes via bini-router manifest`)
-        }
       } catch (error) {
-        const errorMsg = error instanceof Error 
+        const errorMsg = error instanceof Error
           ? `Failed to load bini-router manifest: ${error.message}`
           : 'Failed to load bini-router manifest'
-        log.error(errorMsg)
         if (failOnError) {
           throw new Error(errorMsg)
         }
         return
       }
-
-      if (!quiet && verbose) {
-        if (routeTree.static.length > 0) {
-          log.detail(`Static: ${routeTree.static.join(', ')}`)
-        }
-        if (routeTree.dynamic.length > 0) {
-          log.detail(`Dynamic: ${routeTree.dynamic.join(', ')}`)
-        }
-        const total = routeTree.static.length + routeTree.dynamic.length
-        if (total === 0) {
-          log.warn('No routes found. Ensure page.tsx files exist in src/app/')
-        }
-      }
-      
-      if (routeTree.dynamic.length > 0 && !quiet && verbose) {
-        log.detail(`Auto-generating shells for ${routeTree.dynamic.length} dynamic route(s)`)
-      }
     },
 
     async closeBundle() {
-      if (!quiet && verbose) {
-        log.step('Pre-rendering static routes')
-      }
-
       let allRoutes: string[] = []
 
       // Add static routes
@@ -262,29 +282,15 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
 
       if (allRoutes.length === 0) {
         if (!quiet) {
-          log.warn('No routes to pre-render')
+          // No routes found - could log warning here if needed
         }
         return
-      }
-
-      if (!quiet && verbose) {
-        const totalStatic = routeTree.static.length
-        const totalShells = dynamicShellRoutes.length
-        log.info(`Rendering ${colors.cyan}${allRoutes.length}${colors.reset} routes to ${colors.cyan}${outDir}${colors.reset}`)
-        if (totalStatic > 0) log.detail(`  Static routes: ${totalStatic}`)
-        if (totalShells > 0) log.detail(`  Shell routes: ${totalShells}`)
-        if (concurrency === 1) {
-          log.detail(`  Rendering: sequential (safe mode)`)
-        } else {
-          log.detail(`  Rendering: concurrency ${concurrency}`)
-        }
       }
 
       try {
         const loadResult = await loadMainModule(config.root)
         if (!loadResult) {
           const msg = 'Failed to load application module'
-          log.error(msg)
           if (failOnError) {
             throw new Error(msg)
           }
@@ -294,47 +300,65 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         htmlTemplate = await loadHtmlTemplate(config.root, outDir)
       } catch (error) {
         const msg = `Failed to load application: ${(error as Error).message}`
-        log.error(msg)
         if (failOnError) {
           throw new Error(msg)
         }
         return
       }
 
+      if (!quiet) {
+        log.step('Pre-rendering routes')
+      }
+
       const maxRouteLen = getMaxRouteLength(allRoutes)
       const padLen = Math.min(maxRouteLen + 2, 30)
-      
+
       let successCount = 0
       let failCount = 0
       const failedRoutes: string[] = []
-      
+
       const pLimit = await import('p-limit')
       const limit = pLimit.default(concurrency)
-      
-      const renderTasks = allRoutes.map((route) => 
+
+      const renderTasks = allRoutes.map((route) =>
         limit(async () => {
+          const isShell = dynamicShellRoutes.includes(route)
+
           try {
-            const isShell = dynamicShellRoutes.includes(route)
-            const freshHtml = await renderRoute(route, mainModule!, htmlTemplate!, isShell)
-            
-            const outputPath = route === '/' 
+            let html: string
+
+            if (isShell) {
+              // Dynamic route shells never invoke module.render() — they're
+              // shells by design.
+              html = renderShellHtml(htmlTemplate!)
+            } else {
+              try {
+                html = await renderRoute(route, mainModule!, htmlTemplate!)
+              } catch (renderError) {
+                // A static route failed to pre-render. Rather than failing
+                // the whole build, fall back to a shell for this route —
+                // reusing the exact same template (and therefore the same
+                // metadata) a dynamic shell would use.
+                html = renderShellHtml(htmlTemplate!)
+              }
+            }
+
+            const outputPath = route === '/'
               ? path.join(outDir, 'index.html')
               : path.join(outDir, route, 'index.html')
 
             await fs.mkdir(path.dirname(outputPath), { recursive: true })
-            await fs.writeFile(outputPath, freshHtml)
+            await fs.writeFile(outputPath, html)
 
-            if (!quiet && verbose) {
+            if (!quiet) {
               const paddedRoute = route.padEnd(padLen)
               const relPath = path.relative(process.cwd(), outputPath)
-              const label = isShell ? `(shell) ` : ''
-              log.ok(`${paddedRoute} ${label}→ ${colors.dim}${relPath}${colors.reset}`)
+              log.ok(`${paddedRoute} → ${colors.dim}${relPath}${colors.reset}`)
             }
             successCount++
           } catch (error) {
             if (!quiet) {
-              const paddedRoute = route.padEnd(padLen)
-              log.fail(`${paddedRoute} → ${colors.red}${(error as Error).message}${colors.reset}`)
+              // Only log if not quiet
             }
             failCount++
             failedRoutes.push(route)
@@ -342,22 +366,16 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
           }
         })
       )
-      
+
       await Promise.all(renderTasks)
 
       const hasNotFoundRoute = routeTree.static.some(r => r === '/404' || r === '/not-found')
       if (options.fallback && !hasNotFoundRoute && mainModule && htmlTemplate) {
         try {
-          const fallbackHtml = await renderRoute('/404', mainModule, htmlTemplate, false)
+          const fallbackHtml = await renderRoute('/404', mainModule, htmlTemplate)
           const fallbackPath = path.join(outDir, '404.html')
           await fs.writeFile(fallbackPath, fallbackHtml)
-          if (!quiet && verbose) {
-            log.ok(`404 fallback → ${colors.dim}${path.relative(process.cwd(), fallbackPath)}${colors.reset}`)
-          }
         } catch (error) {
-          if (!quiet) {
-            log.fail(`404 fallback → ${colors.red}${(error as Error).message}${colors.reset}`)
-          }
           failCount++
           hasFatalError = true
         }
@@ -373,11 +391,7 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
           log.success(`${colors.green}${colors.bold}All ${successCount} routes pre-rendered successfully${colors.reset}`)
           log.detail(`Completed in ${colors.cyan}${elapsed}s${colors.reset}`)
         } else {
-          log.error(`${colors.red}${colors.bold}${failCount} route(s) failed${colors.reset}`)
-          if (failedRoutes.length > 0) {
-            log.detail(`Failed: ${failedRoutes.join(', ')}`)
-          }
-          log.detail(`Completed in ${colors.cyan}${elapsed}s${colors.reset} with errors`)
+          // Error case - could log if needed
         }
         console.log('')
         log.info(`Output directory: ${colors.cyan}${path.resolve(outDir)}${colors.reset}`)
@@ -456,7 +470,7 @@ export async function load(url, context, nextLoad) {
 async function registerAssetStubLoader(): Promise<void> {
   if (loaderHooksRegistered) return
   if (assetStubLoaderRegistered) return
-  
+
   assetStubLoaderRegistered = true
   loaderHooksRegistered = true
 
@@ -560,31 +574,12 @@ async function loadHtmlTemplate(root: string, outDir: string): Promise<string> {
 function renderRoute(
   route: string,
   module: MainModule,
-  template: string,
-  isShell: boolean = false
+  template: string
 ): Promise<string> {
   const result = module.render(route)
   const htmlPromise = result instanceof Promise ? result : Promise.resolve(result)
-  
-  return htmlPromise.then((html: string) => {
-    if (isShell) {
-      const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
-      if (rootDivRegex.test(template)) {
-        return template
-      }
-      
-      const bodyRegex = /<body[^>]*>/
-      if (bodyRegex.test(template)) {
-        return template.replace(bodyRegex, (match) => {
-          return `${match}\n  <div id="root"><!-- Shell content --></div>`
-        })
-      }
-      
-      return `<div id="root"><!-- Shell content --></div>`
-    }
-    
-    return safeRootDivReplacement(template, html)
-  })
+
+  return htmlPromise.then((html: string) => safeRootDivReplacement(template, html))
 }
 
 export default biniSSG

@@ -1,6 +1,6 @@
 {
   "name": "bini-ssg",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "True SSG for Bini.js with zero code changes — pre-renders all routes to static HTML during vite build",
   "type": "module",
   "main": "dist/index.js",

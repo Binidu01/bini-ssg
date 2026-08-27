@@ -401,6 +401,18 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
       if (hasFatalError && failOnError) {
         throw new Error(`${failCount} route(s) failed to pre-render`)
       }
+
+      // Force-exit: tsx.register() and registerAssetStubLoader() both call
+      // module.register(), which opens a MessagePort to a loader-hook
+      // worker thread that never gets torn down — there's no public API to
+      // unregister a loader hook. On real Node.js (local, Vercel) this
+      // sometimes still lets the process exit, but on runtimes that
+      // reimplement module.register() themselves (e.g. Deno Deploy's
+      // Node-compat layer) the loader thread can keep the event loop alive
+      // forever even though all actual work is done. Without this, the
+      // build finishes instantly but the process never returns control to
+      // the platform's build step, which reads as a hang/timeout.
+      process.exit(0)
     },
   }
 }

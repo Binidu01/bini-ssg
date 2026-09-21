@@ -1,9 +1,9 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2020", "DOM"],
+    "lib": ["ES2022"],
     "jsx": "react-jsx",
     "strict": true,
     "esModuleInterop": true,
@@ -15,10 +15,8 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "types": ["node"],
-    "noImplicitAny": false,
     "allowSyntheticDefaultImports": true,
-    "ignoreDeprecations": "6.0"  // Add this line
-    // Remove "paths" if you have it
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

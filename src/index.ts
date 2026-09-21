@@ -2,7 +2,8 @@ import type { Plugin, ResolvedConfig } from 'vite'
 import fs from 'fs/promises'
 import path from 'path'
 import os from 'os'
-import { fileURLToPath, pathToFileURL } from 'url'
+import { pathToFileURL } from 'url'
+import { parse, HTMLElement } from 'node-html-parser'
 
 // ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,8 @@ export interface SSGOptions {
   quiet?: boolean
   failOnError?: boolean
   concurrency?: number
+  /** Maximum link-following depth for auto-crawl. Default: 3 */
+  crawlDepth?: number
 }
 
 interface RouteTree {
@@ -69,101 +72,115 @@ function deduplicateRoutes(routes: string[]): string[] {
   return [...new Set(routes)]
 }
 
+// ─── HTML manipulation via node-html-parser ─────────────────────────────────
+
 /**
- * Safely replace the content inside <div id="root"> using depth counting.
+ * Replaces the content inside the #root element of the template with the
+ * rendered app HTML. Uses node-html-parser so we get correct HTML
+ * tokenization — script/style raw-text regions, comments, and self-closing
+ * tags are all handled by the parser, not by hand-rolled depth counting.
+ *
+ * If #root is missing, it's inserted into <body> (or the document root as a
+ * last resort). If <body> is also missing, the parsed structure is preserved
+ * as-is and the rendered HTML is appended.
  */
 function safeRootDivReplacement(template: string, content: string): string {
-  const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
-  const match = template.match(rootDivRegex)
+  const root = parse(template, {
+    comment: true,
+    voidTag: { closingSlash: true },
+  })
 
-  if (!match) {
-    const bodyRegex = /<body[^>]*>/
-    if (bodyRegex.test(template)) {
-      return template.replace(bodyRegex, (match) => {
-        return `${match}\n  <div id="root">${content}</div>`
-      })
+  const rootEl = root.querySelector('#root')
+
+  if (rootEl) {
+    // Preserve attributes on #root, replace only its inner content.
+    // node-html-parser's innerHTML setter accepts a raw HTML string.
+    rootEl.innerHTML = content
+    return root.toString()
+  }
+
+  const body = root.querySelector('body')
+  if (body) {
+    body.insertAdjacentHTML('afterbegin', `<div id="root">${content}</div>`)
+    return root.toString()
+  }
+
+  // No <body> either — extremely rare; fall back to prepending.
+  return `<div id="root">${content}</div>${root.toString()}`
+}
+
+// ─── Link extraction (pure Node, no browser) ────────────────────────────────
+
+/**
+ * Extracts all internal href values from a rendered HTML string.
+ * Filters out external URLs, hash links, mailto/tel, and static asset paths.
+ */
+function extractInternalLinks(html: string): string[] {
+  const links: string[] = []
+  const seen = new Set<string>()
+  const hrefRegex = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi
+
+  let match: RegExpExecArray | null
+  while ((match = hrefRegex.exec(html)) !== null) {
+    const href = match[1].trim()
+
+    if (!href) continue
+    if (href.startsWith('#')) continue
+    if (href.startsWith('mailto:') || href.startsWith('tel:')) continue
+    if (href.startsWith('javascript:')) continue
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(href)) continue
+    if (href.startsWith('//')) continue
+    if (
+      href.startsWith('/assets/') ||
+      href.startsWith('/_next/') ||
+      href.startsWith('/static/') ||
+      /\.(png|jpe?g|gif|svg|webp|avif|ico|css|js|mjs|map|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf|xml|txt|json)(\?|#|$)/i.test(href)
+    ) {
+      continue
     }
-    return `<div id="root">${content}</div>`
-  }
 
-  if (match.index === undefined) {
-    return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
-  }
+    let normalized = href.split('#')[0].split('?')[0]
+    if (!normalized.startsWith('/')) normalized = '/' + normalized
+    if (normalized.length > 1 && normalized.endsWith('/')) {
+      normalized = normalized.slice(0, -1)
+    }
 
-  const tagMatch = match[0]
-  if (tagMatch.endsWith('/>')) {
-    const before = template.slice(0, match.index)
-    const after = template.slice(match.index + tagMatch.length)
-    return `${before}<div id="root">${content}</div>${after}`
-  }
-
-  const startIndex = match.index + match[0].length
-  let depth = 1
-  let endIndex = startIndex
-
-  for (let i = startIndex; i < template.length; i++) {
-    if (template[i] === '<') {
-      if (template.slice(i, i + 4) === '<div') {
-        const nextChar = template[i + 4] || ''
-        if (/[\s/>]/.test(nextChar)) {
-          let j = i + 4
-          let isSelfClosing = false
-          while (j < template.length && template[j] !== '>') {
-            if (template[j] === '/' && template[j + 1] === '>') {
-              isSelfClosing = true
-              break
-            }
-            j++
-          }
-          if (!isSelfClosing) {
-            depth++
-          }
-        }
-      } else if (template.slice(i, i + 6) === '</div>') {
-        depth--
-        if (depth === 0) {
-          endIndex = i + 6
-          break
-        }
-      }
+    if (!seen.has(normalized)) {
+      seen.add(normalized)
+      links.push(normalized)
     }
   }
 
-  if (endIndex === startIndex) {
-    return template.replace(rootDivRegex, `<div id="root">${content}</div>`)
+  return links
+}
+
+/**
+ * Checks whether a concrete route matches a dynamic pattern.
+ * e.g. routeMatchesPattern('/blog/hello', '/blog/:slug') === true
+ */
+function routeMatchesPattern(route: string, pattern: string): boolean {
+  const routeParts = route.split('/').filter(Boolean)
+  const patternParts = pattern.split('/').filter(Boolean)
+
+  const lastPattern = patternParts[patternParts.length - 1]
+  if (lastPattern === '*' || lastPattern.startsWith('[...')) {
+    if (routeParts.length < patternParts.length - 1) return false
+  } else if (patternParts.length !== routeParts.length) {
+    return false
   }
 
-  return template.slice(0, startIndex) + content + template.slice(endIndex)
+  for (let i = 0; i < patternParts.length; i++) {
+    const p = patternParts[i]
+    if (p.startsWith(':') || p.startsWith('[') || p === '*') continue
+    if (p !== routeParts[i]) return false
+  }
+  return true
 }
 
 // ─── Shell HTML ─────────────────────────────────────────────────────────────
 
-/**
- * Builds shell HTML for a route without invoking module.render(). Used both
- * for dynamic-route shells and for static routes that failed to pre-render
- * and are falling back to a shell so the build doesn't break.
- *
- * IMPORTANT: the template is reused as-is. It already carries whatever
- * metadata your build produced for that route (title, meta tags, hashed
- * asset links, custom <meta name="..."> entries, etc). We never rewrite or
- * add metadata here — doing so would make the server-emitted <head> diverge
- * from what the client bundle expects on hydrate, causing hydration errors.
- * The only thing we ever touch is making sure a #root mount point exists.
- */
 const SHELL_MARKER_SCRIPT = '<script>window.__BINI_SHELL__=true;</script>'
 
-/**
- * Marks the document as a shell so the client entry knows to do a plain
- * client-side render instead of hydrateRoot(). Without this, React tries to
- * hydrate the shell's empty #root against the real component tree, the DOM
- * it finds doesn't match anything it expected, and it throws React error
- * #418 ("Hydration failed because the initial UI does not match what was
- * rendered on the server").
- *
- * Placed as a plain (non-module) inline script, which — unlike the app's
- * `type="module"` entry script — runs synchronously during parsing, so it's
- * guaranteed to execute before the module script that mounts the app.
- */
 function injectShellMarker(template: string): string {
   if (template.includes('__BINI_SHELL__')) return template
   if (/<\/head>/i.test(template)) {
@@ -177,21 +194,22 @@ function injectShellMarker(template: string): string {
 }
 
 function renderShellHtml(template: string): string {
-  let html = injectShellMarker(template)
+  const html = injectShellMarker(template)
 
-  const rootDivRegex = /<div[^>]*id=["']root["'][^>]*>/
-  if (rootDivRegex.test(html)) {
-    return html
+  const root = parse(html, { comment: true })
+  const rootEl = root.querySelector('#root')
+  if (rootEl) {
+    // #root already exists — nothing else to do.
+    return root.toString()
   }
 
-  const bodyRegex = /<body[^>]*>/
-  if (bodyRegex.test(html)) {
-    return html.replace(bodyRegex, (match) => {
-      return `${match}\n  <div id="root"><!-- Shell content --></div>`
-    })
+  const body = root.querySelector('body')
+  if (body) {
+    body.insertAdjacentHTML('afterbegin', `<div id="root"><!-- Shell content --></div>`)
+    return root.toString()
   }
 
-  return `<div id="root"><!-- Shell content --></div>`
+  return `<div id="root"><!-- Shell content --></div>${root.toString()}`
 }
 
 // ─── Route manifest from bini-router ───────────────────────────────────────
@@ -222,6 +240,7 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
   const failOnError = options.failOnError !== false
   const concurrency = options.concurrency ?? 1
   const includeRoot = options.includeRoot !== false
+  const crawlDepth = options.crawlDepth ?? 3
   const startTime = Date.now()
 
   let mainModule: MainModule | null = null
@@ -260,49 +279,29 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
     },
 
     async closeBundle() {
-      let allRoutes: string[] = []
+      // ── Seed routes ────────────────────────────────────────────────────
+      const seedRoutes: string[] = [...routeTree.static]
 
-      // Add static routes
-      allRoutes.push(...routeTree.static)
-
-      // Generate shells for dynamic routes
-      const dynamicShellRoutes: string[] = []
-      for (const dynamicPattern of routeTree.dynamic) {
-        const shellRoute = patternToShellRoute(dynamicPattern)
-        dynamicShellRoutes.push(shellRoute)
-        allRoutes.push(shellRoute)
+      if (includeRoot && !seedRoutes.includes('/')) {
+        seedRoutes.unshift('/')
       }
 
-      // Add root route if not included
-      if (includeRoot && !allRoutes.includes('/')) {
-        allRoutes.unshift('/')
-      }
-
-      allRoutes = deduplicateRoutes(allRoutes)
-
-      if (allRoutes.length === 0) {
-        if (!quiet) {
-          // No routes found - could log warning here if needed
-        }
+      if (seedRoutes.length === 0 && routeTree.dynamic.length === 0) {
         return
       }
 
+      // ── Load app module + template ─────────────────────────────────────
       try {
         const loadResult = await loadMainModule(config.root)
         if (!loadResult) {
-          const msg = 'Failed to load application module'
-          if (failOnError) {
-            throw new Error(msg)
-          }
+          if (failOnError) throw new Error('Failed to load application module')
           return
         }
         mainModule = loadResult
         htmlTemplate = await loadHtmlTemplate(config.root, outDir)
       } catch (error) {
         const msg = `Failed to load application: ${(error as Error).message}`
-        if (failOnError) {
-          throw new Error(msg)
-        }
+        if (failOnError) throw new Error(msg)
         return
       }
 
@@ -310,72 +309,120 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         log.step('Pre-rendering routes')
       }
 
-      const maxRouteLen = getMaxRouteLength(allRoutes)
-      const padLen = Math.min(maxRouteLen + 2, 30)
+      // ── Crawl + render loop ────────────────────────────────────────────
+      const visited = new Set<string>()
+      const queue: Array<{ route: string; depth: number }> = seedRoutes.map(
+        (r) => ({ route: r, depth: 0 })
+      )
+      const queued = new Set<string>(seedRoutes)
+
+      const pLimit = await import('p-limit')
+      const limit = pLimit.default(concurrency)
 
       let successCount = 0
       let failCount = 0
       const failedRoutes: string[] = []
 
-      const pLimit = await import('p-limit')
-      const limit = pLimit.default(concurrency)
+      while (queue.length > 0) {
+        const batch = queue.splice(0, queue.length)
 
-      const renderTasks = allRoutes.map((route) =>
-        limit(async () => {
-          const isShell = dynamicShellRoutes.includes(route)
+        await Promise.all(
+          batch.map(({ route, depth }) =>
+            limit(async () => {
+              if (visited.has(route)) return
+              visited.add(route)
 
-          try {
-            let html: string
+              let html: string
 
-            if (isShell) {
-              // Dynamic route shells never invoke module.render() — they're
-              // shells by design.
-              html = renderShellHtml(htmlTemplate!)
-            } else {
               try {
                 html = await renderRoute(route, mainModule!, htmlTemplate!)
-              } catch (renderError) {
-                // A static route failed to pre-render. Rather than failing
-                // the whole build, fall back to a shell for this route —
-                // reusing the exact same template (and therefore the same
-                // metadata) a dynamic shell would use.
+              } catch {
+                // Any render error → silent shell fallback.
                 html = renderShellHtml(htmlTemplate!)
               }
-            }
 
-            const outputPath = route === '/'
-              ? path.join(outDir, 'index.html')
-              : path.join(outDir, route, 'index.html')
+              const outputPath =
+                route === '/'
+                  ? path.join(outDir, 'index.html')
+                  : path.join(outDir, route, 'index.html')
 
+              try {
+                await fs.mkdir(path.dirname(outputPath), { recursive: true })
+                await fs.writeFile(outputPath, html)
+              } catch {
+                failCount++
+                failedRoutes.push(route)
+                hasFatalError = true
+                return
+              }
+
+              successCount++
+
+              if (!quiet) {
+                const paddedRoute = route.padEnd(
+                  Math.min(getMaxRouteLength([...visited]) + 2, 40)
+                )
+                const relPath = path.relative(process.cwd(), outputPath)
+                console.log(`  ${colors.green}ok${colors.reset}    ${paddedRoute} → ${colors.dim}${relPath}${colors.reset}`)
+              }
+
+              // Crawl links from this page (regardless of shell or full).
+              if (depth < crawlDepth) {
+                const links = extractInternalLinks(html)
+                for (const link of links) {
+                  if (!visited.has(link) && !queued.has(link)) {
+                    queued.add(link)
+                    queue.push({ route: link, depth: depth + 1 })
+                  }
+                }
+              }
+            })
+          )
+        )
+      }
+
+      // ── Shell fallback for undiscovered dynamic patterns ───────────────
+      for (const pattern of routeTree.dynamic) {
+        const discovered = [...visited].some((route) =>
+          routeMatchesPattern(route, pattern)
+        )
+        if (!discovered) {
+          const shellRoute = patternToShellRoute(pattern)
+          if (visited.has(shellRoute)) continue
+          visited.add(shellRoute)
+
+          const shellHtml = renderShellHtml(htmlTemplate!)
+          const outputPath = path.join(outDir, shellRoute, 'index.html')
+          try {
             await fs.mkdir(path.dirname(outputPath), { recursive: true })
-            await fs.writeFile(outputPath, html)
+            await fs.writeFile(outputPath, shellHtml)
+            successCount++
 
             if (!quiet) {
-              const paddedRoute = route.padEnd(padLen)
+              const paddedRoute = shellRoute.padEnd(
+                Math.min(getMaxRouteLength([...visited]) + 2, 40)
+              )
               const relPath = path.relative(process.cwd(), outputPath)
-              log.ok(`${paddedRoute} → ${colors.dim}${relPath}${colors.reset}`)
+              console.log(`  ${colors.green}ok${colors.reset}    ${paddedRoute} → ${colors.dim}${relPath}${colors.reset}`)
             }
-            successCount++
-          } catch (error) {
-            if (!quiet) {
-              // Only log if not quiet
-            }
+          } catch {
             failCount++
-            failedRoutes.push(route)
+            failedRoutes.push(shellRoute)
             hasFatalError = true
           }
-        })
+        }
+      }
+
+      // ── 404 fallback ───────────────────────────────────────────────────
+      const hasNotFoundRoute = routeTree.static.some(
+        (r) => r === '/404' || r === '/not-found'
       )
-
-      await Promise.all(renderTasks)
-
-      const hasNotFoundRoute = routeTree.static.some(r => r === '/404' || r === '/not-found')
       if (options.fallback && !hasNotFoundRoute && mainModule && htmlTemplate) {
         try {
           const fallbackHtml = await renderRoute('/404', mainModule, htmlTemplate)
           const fallbackPath = path.join(outDir, '404.html')
           await fs.writeFile(fallbackPath, fallbackHtml)
-        } catch (error) {
+        } catch {
           failCount++
           hasFatalError = true
         }
@@ -387,12 +434,10 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
 
       if (!quiet) {
         console.log('')
-        if (failCount === 0) {
-          log.success(`${colors.green}${colors.bold}All ${successCount} routes pre-rendered successfully${colors.reset}`)
-          log.detail(`Completed in ${colors.cyan}${elapsed}s${colors.reset}`)
-        } else {
-          // Error case - could log if needed
-        }
+        log.success(
+          `${colors.green}${colors.bold}Pre-rendered ${successCount} routes${colors.reset}`
+        )
+        log.detail(`Completed in ${colors.cyan}${elapsed}s${colors.reset}`)
         console.log('')
         log.info(`Output directory: ${colors.cyan}${path.resolve(outDir)}${colors.reset}`)
         console.log('')
@@ -402,16 +447,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         throw new Error(`${failCount} route(s) failed to pre-render`)
       }
 
-      // Force-exit: tsx.register() and registerAssetStubLoader() both call
-      // module.register(), which opens a MessagePort to a loader-hook
-      // worker thread that never gets torn down — there's no public API to
-      // unregister a loader hook. On real Node.js (local, Vercel) this
-      // sometimes still lets the process exit, but on runtimes that
-      // reimplement module.register() themselves (e.g. Deno Deploy's
-      // Node-compat layer) the loader thread can keep the event loop alive
-      // forever even though all actual work is done. Without this, the
-      // build finishes instantly but the process never returns control to
-      // the platform's build step, which reads as a hang/timeout.
       process.exit(0)
     },
   }

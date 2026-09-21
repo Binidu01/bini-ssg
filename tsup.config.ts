@@ -12,6 +12,6 @@ export default defineConfig({
   target: 'node18',
   platform: 'node',
   splitting: false,
-  external: ['vite', 'react', 'react-dom', 'react-router-dom', 'tsx'],
+  external: ['vite', 'react', 'react-dom', 'react-router-dom', 'tsx', 'node-html-parser'],
   skipNodeModulesBundle: true,
 })

@@ -1,6 +1,6 @@
 {
   "name": "bini-ssg",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "True SSG for Bini.js with zero code changes — auto-discovers dynamic routes and pre-renders them to static HTML during vite build",
   "type": "module",
   "sideEffects": false,
@@ -51,6 +51,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "html-minifier-terser": "^7.2.0",
     "node-html-parser": "^9.0.4",
     "p-limit": "^7.0.0"
   },
@@ -63,9 +64,11 @@
     "vite": "^8.0.0"
   },
   "devDependencies": {
+    "@types/html-minifier-terser": "^7.0.2",
     "@types/node": "^20.19.43",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
+    "bini-router": "link:../bini-router",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tsup": "^8.5.1",

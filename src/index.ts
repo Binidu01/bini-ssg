@@ -1,9 +1,13 @@
+// <reference types="vite/client" />
+
 import type { Plugin, ResolvedConfig } from 'vite'
+import type { RouteManifestEntry } from 'bini-router'
 import fs from 'fs/promises'
 import path from 'path'
 import os from 'os'
 import { pathToFileURL } from 'url'
-import { parse, HTMLElement } from 'node-html-parser'
+import { parse } from 'node-html-parser'
+import { minify as minifyHtmlTerser } from 'html-minifier-terser'
 
 // ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +43,8 @@ export interface SSGOptions {
   concurrency?: number
   /** Maximum link-following depth for auto-crawl. Default: 3 */
   crawlDepth?: number
+  /** Minify the pre-rendered HTML with html-minifier-terser. Default: true */
+  minify?: boolean
 }
 
 interface RouteTree {
@@ -51,12 +57,24 @@ interface MainModule {
   render: (url: string) => Promise<string> | string
 }
 
+/**
+ * Structured head content, emitted by bini-router. bini-ssg is the only
+ * package that turns this into HTML — the router never produces HTML.
+ */
+export type HeadNode =
+  | { t: 'element'; tag: string; attrs: Record<string, string>; children: HeadNode[] }
+  | { t: 'text'; value: string }
+  | { t: 'raw'; value: string }
+
 // ─── Module-level state ─────────────────────────────────────────────────────
 
 let tsxRegistered = false
 let assetStubLoaderPath: string | null = null
 let assetStubLoaderRegistered = false
 let loaderHooksRegistered = false
+
+// Captured CSS map from generateBundle: source module path → hashed CSS URLs
+let capturedCss: Map<string, string[]> | null = null
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -72,18 +90,69 @@ function deduplicateRoutes(routes: string[]): string[] {
   return [...new Set(routes)]
 }
 
-// ─── HTML manipulation via node-html-parser ─────────────────────────────────
+/**
+ * Normalize a path for cross-platform comparison: forward slashes, lowercase.
+ *
+ * This exists because bini-router reads paths from the filesystem (Windows
+ * produces backslashes: `C:\...\blog.css`) while Vite keys its module graph
+ * and chunk metadata by forward-slash-normalized IDs (`C:/.../blog.css`).
+ * Without normalization, `resolveHashedCss` silently fails on Windows and
+ * pre-rendered pages ship without their route-scoped CSS.
+ */
+function normPath(p: string): string {
+  return p.replace(/\\/g, '/').toLowerCase()
+}
+
+// ─── HTML minification via html-minifier-terser ─────────────────────────────
 
 /**
- * Replaces the content inside the #root element of the template with the
- * rendered app HTML. Uses node-html-parser so we get correct HTML
- * tokenization — script/style raw-text regions, comments, and self-closing
- * tags are all handled by the parser, not by hand-rolled depth counting.
+ * Minifies a fully-rendered HTML document using html-minifier-terser.
  *
- * If #root is missing, it's inserted into <body> (or the document root as a
- * last resort). If <body> is also missing, the parsed structure is preserved
- * as-is and the rendered HTML is appended.
+ * Configuration is tuned for React SSG hydration safety:
+ *   - `conservativeCollapse: true` always collapses to a single space,
+ *     never removing whitespace entirely. This is what prevents React
+ *     hydration mismatches from stripped text nodes.
+ *   - `collapseWhitespace: true` enables the collapse pass; it must be
+ *     paired with conservativeCollapse to be hydration-safe.
+ *   - `removeComments: false` keeps React's `<!--$-->` boundary markers.
+ *   - `sortAttributes: false` and `sortClassName: false` prevent React
+ *     from seeing reordered props/classes during hydration.
+ *
+ * On failure, returns the original HTML rather than throwing — a malformed
+ * page should never fail the whole build. A warning is logged once per
+ * build so a systematically-broken minifier surfaces in the build log.
  */
+let minifyWarned = false
+
+async function minifyHtml(html: string): Promise<string> {
+  try {
+    return await minifyHtmlTerser(html, {
+      collapseWhitespace: true,
+      conservativeCollapse: true,
+      removeComments: false,
+      sortAttributes: false,
+      sortClassName: false,
+      removeRedundantAttributes: true,
+      removeEmptyAttributes: true,
+      useShortDoctype: true,
+      minifyCSS: true,
+      minifyJS: true,
+    })
+  } catch (error) {
+    if (!minifyWarned) {
+      minifyWarned = true
+      console.warn(
+        `[bini-ssg] HTML minification failed; falling back to unminified output. ` +
+        `This warning is shown once per build. Error: ` +
+        (error instanceof Error ? error.message : String(error)),
+      )
+    }
+    return html
+  }
+}
+
+// ─── HTML manipulation via node-html-parser ─────────────────────────────────
+
 function safeRootDivReplacement(template: string, content: string): string {
   const root = parse(template, {
     comment: true,
@@ -93,8 +162,6 @@ function safeRootDivReplacement(template: string, content: string): string {
   const rootEl = root.querySelector('#root')
 
   if (rootEl) {
-    // Preserve attributes on #root, replace only its inner content.
-    // node-html-parser's innerHTML setter accepts a raw HTML string.
     rootEl.innerHTML = content
     return root.toString()
   }
@@ -105,59 +172,371 @@ function safeRootDivReplacement(template: string, content: string): string {
     return root.toString()
   }
 
-  // No <body> either — extremely rare; fall back to prepending.
   return `<div id="root">${content}</div>${root.toString()}`
 }
 
-// ─── Link extraction (pure Node, no browser) ────────────────────────────────
+// ─── Head tree → HTML (the single place HTML is generated) ──────────────────
+
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+])
+
+function escapeAttr(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function escapeText(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
 
 /**
- * Extracts all internal href values from a rendered HTML string.
- * Filters out external URLs, hash links, mailto/tel, and static asset paths.
+ * Serializes a HeadNode[] tree from bini-router into HTML. All escaping
+ * for author-written head content happens here, exactly once. The router
+ * never escapes, never produces HTML — this is the contract.
+ *
+ * `{ t: 'raw' }` is the explicit opt-in escape hatch for authors who
+ * genuinely need to inject raw markup (e.g. JSON-LD). It is intentionally
+ * visible and greppable in the manifest.
+ */
+export function headTreeToHtml(nodes: HeadNode[]): string {
+  let out = ''
+  for (const n of nodes) {
+    if (n.t === 'text') {
+      out += escapeText(n.value)
+    } else if (n.t === 'raw') {
+      out += n.value
+    } else {
+      const attrs = Object.entries(n.attrs)
+        .map(([k, v]) => (v === '' ? k : `${k}="${escapeAttr(v)}"`))
+        .join(' ')
+      const open = attrs ? `<${n.tag} ${attrs}>` : `<${n.tag}>`
+      if (VOID_ELEMENTS.has(n.tag.toLowerCase())) {
+        out += open
+      } else {
+        out += `${open}${headTreeToHtml(n.children)}</${n.tag}>`
+      }
+    }
+  }
+  return out
+}
+
+// ─── Metadata + CSS injection ───────────────────────────────────────────────
+
+/**
+ * Given rendered HTML and a merged metadata entry (from bini-router),
+ * replaces/injects <title> and a curated set of <meta>/<link> tags, and
+ * appends any structured `document.head` content. Never touches anything
+ * else in <head>.
+ */
+function applyMetadataToHtml(
+  html: string,
+  meta: RouteManifestEntry | null,
+): string {
+  if (!meta) return html
+
+  const root = parse(html, { comment: true })
+  const head = root.querySelector('head')
+  if (!head) return html
+
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' ? v : undefined
+
+  const m = meta.meta as Record<string, unknown>
+
+  // Title — prefer top-level, fall back to nested
+  const title = str(meta.title) ?? str(m.title)
+  if (title) {
+    const existing = head.querySelector('title')
+    if (existing) existing.textContent = title
+    else head.insertAdjacentHTML('afterbegin', `<title>${escapeText(title)}</title>`)
+  }
+
+  const ensureMeta = (name: string, content: string, property = false) => {
+    const attr = property ? 'property' : 'name'
+    const existing = head.querySelector(`meta[${attr}="${name}"]`)
+    if (existing) existing.setAttribute('content', content)
+    else head.insertAdjacentHTML('beforeend', `<meta ${attr}="${name}" content="${escapeAttr(content)}" />`)
+  }
+
+  const ensureLink = (rel: string, href: string, extra: Record<string, string> = {}) => {
+    const existing = head.querySelector(`link[rel="${rel}"]`)
+    const attrs = [
+      `rel="${escapeAttr(rel)}"`,
+      `href="${escapeAttr(href)}"`,
+      ...Object.entries(extra).map(([k, v]) => `${k}="${escapeAttr(v)}"`),
+    ].join(' ')
+    if (existing) existing.setAttribute('href', href)
+    else head.insertAdjacentHTML('beforeend', `<link ${attrs} />`)
+  }
+
+  if (str(m.description)) ensureMeta('description', str(m.description)!)
+  if (str(m.themeColor)) ensureMeta('theme-color', str(m.themeColor)!)
+  if (str(m.robots)) ensureMeta('robots', str(m.robots)!)
+  if (str(m.author)) ensureMeta('author', str(m.author)!)
+
+  const keywords = m.keywords
+  if (typeof keywords === 'string') ensureMeta('keywords', keywords)
+  else if (Array.isArray(keywords)) {
+    const joined = keywords.filter((k): k is string => typeof k === 'string').join(', ')
+    if (joined) ensureMeta('keywords', joined)
+  }
+
+  if (str(m.canonical)) ensureLink('canonical', str(m.canonical)!)
+  if (str(m.manifest)) ensureLink('manifest', str(m.manifest)!)
+
+  // Icons
+  const icons = m.icons as Record<string, Array<{ url: string; type?: string; sizes?: string }>> | undefined
+  if (icons) {
+    for (const entry of icons.icon ?? []) {
+      const extra: Record<string, string> = {}
+      if (entry.type) extra.type = entry.type
+      if (entry.sizes) extra.sizes = entry.sizes
+      ensureLink('icon', entry.url, extra)
+    }
+    for (const entry of icons.shortcut ?? []) {
+      ensureLink('shortcut icon', entry.url)
+    }
+    for (const entry of icons.apple ?? []) {
+      const extra: Record<string, string> = {}
+      if (entry.type) extra.type = entry.type
+      if (entry.sizes) extra.sizes = entry.sizes
+      ensureLink('apple-touch-icon', entry.url, extra)
+    }
+  }
+
+  // OpenGraph
+  const og = m.openGraph as Record<string, unknown> | undefined
+  if (og) {
+    if (str(og.title)) {
+      ensureMeta('og:title', str(og.title)!, true)
+      ensureMeta('og:type', str(og.type) ?? 'website', true)
+      if (str(og.description)) ensureMeta('og:description', str(og.description)!, true)
+      if (str(og.url)) ensureMeta('og:url', str(og.url)!, true)
+      if (str(og.image)) ensureMeta('og:image', str(og.image)!, true)
+    }
+  }
+
+  // Twitter
+  const tw = m.twitter as Record<string, unknown> | undefined
+  if (tw) {
+    if (str(tw.title)) {
+      ensureMeta('twitter:card', str(tw.card) ?? 'summary_large_image')
+      ensureMeta('twitter:title', str(tw.title)!)
+      if (str(tw.description)) ensureMeta('twitter:description', str(tw.description)!)
+      if (str(tw.creator)) ensureMeta('twitter:creator', str(tw.creator)!)
+      if (str(tw.image)) ensureMeta('twitter:image', str(tw.image)!)
+    }
+  }
+
+  // ── Structured document.head from bini-router ────────────────────────────
+  // This is the ONLY place document.head content becomes HTML.
+  const headNodes = meta.document?.head
+  if (Array.isArray(headNodes) && headNodes.length > 0) {
+    const headHtml = headTreeToHtml(headNodes)
+    if (headHtml) {
+      head.insertAdjacentHTML('beforeend', headHtml)
+    }
+  }
+
+  // ── document.html / document.body attribute maps ─────────────────────────
+  const doc = meta.document
+  if (doc) {
+    const htmlEl = root.querySelector('html')
+    if (htmlEl && doc.html) {
+      for (const [k, v] of Object.entries(doc.html)) {
+        if (typeof v === 'string') htmlEl.setAttribute(k, v)
+      }
+    }
+    const bodyEl = root.querySelector('body')
+    if (bodyEl && doc.body) {
+      for (const [k, v] of Object.entries(doc.body)) {
+        if (typeof v === 'string') bodyEl.setAttribute(k, v)
+      }
+    }
+  }
+
+  return root.toString()
+}
+
+/**
+ * Resolves a source CSS path to its hashed output URLs using the map
+ * captured from Vite's generateBundle hook.
+ *
+ * Both sides of the comparison are normalized (forward slashes, lowercase)
+ * so Windows manifests and Vite's POSIX-style module IDs match.
+ */
+function resolveHashedCss(sourcePath: string): string[] {
+  if (!capturedCss) return []
+
+  const results: string[] = []
+  const target = normPath(path.resolve(sourcePath))
+
+  // Direct: exact normalized path match
+  for (const [key, urls] of capturedCss) {
+    if (normPath(key) === target) {
+      results.push(...urls)
+    }
+  }
+
+  if (results.length > 0) return [...new Set(results)]
+
+  // Fallback: basename match (normalized, so Windows/Linux agree)
+  const base = normPath(path.basename(sourcePath, path.extname(sourcePath)))
+  for (const [key, urls] of capturedCss) {
+    const keyBase = normPath(path.basename(key, path.extname(key)))
+    if (keyBase === base) {
+      results.push(...urls)
+    }
+  }
+
+  return [...new Set(results)]
+}
+
+/**
+ * Injects <link rel="stylesheet"> tags for the given source CSS paths,
+ * resolved to their hashed output URLs. Deduplicates so shared CSS is
+ * only injected once per page.
+ */
+function injectCssLinks(html: string, sourceCssPaths: string[]): string {
+  if (!capturedCss || sourceCssPaths.length === 0) return html
+
+  const hashedUrls = new Set<string>()
+  for (const src of sourceCssPaths) {
+    for (const url of resolveHashedCss(src)) {
+      hashedUrls.add(url)
+    }
+  }
+  if (hashedUrls.size === 0) return html
+
+  const root = parse(html, { comment: true })
+  const head = root.querySelector('head')
+  if (!head) return html
+
+  // Remove any existing stylesheet links pointing at the same URLs.
+  for (const link of head.querySelectorAll('link[rel="stylesheet"]')) {
+    const href = link.getAttribute('href') ?? ''
+    const normalized = href.replace(/^\/+/, '')
+    if ([...hashedUrls].some((u) => u === normalized || href.endsWith(u))) {
+      link.remove()
+    }
+  }
+
+  for (const url of hashedUrls) {
+    const href = '/' + url.replace(/^\/+/, '')
+    head.insertAdjacentHTML('beforeend', `<link rel="stylesheet" href="${escapeAttr(href)}" />`)
+  }
+
+  return root.toString()
+}
+
+// ─── Link extraction (parser-based, not regex) ──────────────────────────────
+
+/**
+ * Collapse `/a/../b` and `//` runs in a path without pulling in URL
+ * utilities. Input is expected to already be absolute (start with `/`).
+ */
+function resolvePathSegments(p: string): string {
+  const parts = p.split('/')
+  const out: string[] = []
+
+  for (const part of parts) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      out.pop()
+      continue
+    }
+    out.push(part)
+  }
+
+  return '/' + out.join('/')
+}
+
+/**
+ * Extract internal navigation links from rendered HTML.
+ *
+ * Uses node-html-parser instead of a regex, so it correctly handles:
+ *   - HTML entities in href values (`&amp;` → `&`)
+ *   - single-quoted, double-quoted, and unquoted attributes
+ *   - attribute values containing `>` or `<`
+ *   - <a> inside <script> or comments (ignored)
+ *   - <base href> resolution
+ *
+ * External links, mailto:, tel:, javascript:, hash-only, and asset URLs
+ * are excluded. Returns normalized absolute paths (no trailing slash,
+ * no query, no hash) — one entry per unique destination.
  */
 function extractInternalLinks(html: string): string[] {
+  let root: ReturnType<typeof parse>
+  try {
+    root = parse(html, { comment: true })
+  } catch {
+    return []
+  }
+
+  // <base href> affects relative URL resolution. If present, respect it.
+  const baseHref = root.querySelector('base')?.getAttribute('href') ?? '/'
+
   const links: string[] = []
   const seen = new Set<string>()
-  const hrefRegex = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi
 
-  let match: RegExpExecArray | null
-  while ((match = hrefRegex.exec(html)) !== null) {
-    const href = match[1].trim()
+  for (const a of root.querySelectorAll('a[href]')) {
+    // node-html-parser's getAttribute decodes HTML entities.
+    const raw = a.getAttribute('href')
+    if (!raw) continue
 
+    const href = raw.trim()
     if (!href) continue
     if (href.startsWith('#')) continue
-    if (href.startsWith('mailto:') || href.startsWith('tel:')) continue
-    if (href.startsWith('javascript:')) continue
+    if (href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('javascript:')) continue
+
+    // Absolute URLs (scheme://host/...) and protocol-relative (//host/...)
+    // are treated as external. The crawler has no current-host context.
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(href)) continue
     if (href.startsWith('//')) continue
+
+    // Resolve relative to <base href>, then strip query and hash.
+    let resolved = href
+    if (!resolved.startsWith('/')) {
+      const base = baseHref.endsWith('/') ? baseHref : baseHref + '/'
+      resolved = base + resolved
+    }
+
+    resolved = resolvePathSegments(resolved.split('#')[0].split('?')[0])
+
+    if (!resolved.startsWith('/')) continue
+
+    // Skip asset-like URLs on the decoded, resolved path.
     if (
-      href.startsWith('/assets/') ||
-      href.startsWith('/_next/') ||
-      href.startsWith('/static/') ||
-      /\.(png|jpe?g|gif|svg|webp|avif|ico|css|js|mjs|map|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf|xml|txt|json)(\?|#|$)/i.test(href)
+      resolved.startsWith('/assets/') ||
+      resolved.startsWith('/_next/') ||
+      resolved.startsWith('/static/') ||
+      /\.(png|jpe?g|gif|svg|webp|avif|ico|css|js|mjs|map|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf|xml|txt|json)$/i.test(resolved)
     ) {
       continue
     }
 
-    let normalized = href.split('#')[0].split('?')[0]
-    if (!normalized.startsWith('/')) normalized = '/' + normalized
-    if (normalized.length > 1 && normalized.endsWith('/')) {
-      normalized = normalized.slice(0, -1)
+    // Normalize trailing slash (except root).
+    if (resolved.length > 1 && resolved.endsWith('/')) {
+      resolved = resolved.slice(0, -1)
     }
 
-    if (!seen.has(normalized)) {
-      seen.add(normalized)
-      links.push(normalized)
+    if (!seen.has(resolved)) {
+      seen.add(resolved)
+      links.push(resolved)
     }
   }
 
   return links
 }
 
-/**
- * Checks whether a concrete route matches a dynamic pattern.
- * e.g. routeMatchesPattern('/blog/hello', '/blog/:slug') === true
- */
 function routeMatchesPattern(route: string, pattern: string): boolean {
   const routeParts = route.split('/').filter(Boolean)
   const patternParts = pattern.split('/').filter(Boolean)
@@ -199,7 +578,6 @@ function renderShellHtml(template: string): string {
   const root = parse(html, { comment: true })
   const rootEl = root.querySelector('#root')
   if (rootEl) {
-    // #root already exists — nothing else to do.
     return root.toString()
   }
 
@@ -218,6 +596,8 @@ async function getBiniRouterAPI() {
   const biniRouter = await import('bini-router')
   return {
     generateRouteManifest: biniRouter.generateRouteManifest,
+    getMetadataForRoute: biniRouter.getMetadataForRoute,
+    getCssForRoute: biniRouter.getCssForRoute,
   }
 }
 
@@ -241,12 +621,31 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
   const concurrency = options.concurrency ?? 1
   const includeRoot = options.includeRoot !== false
   const crawlDepth = options.crawlDepth ?? 3
+  const minify = options.minify !== false
   const startTime = Date.now()
 
   let mainModule: MainModule | null = null
   let htmlTemplate: string | null = null
   let hasFatalError = false
   let outDir: string = 'dist'
+
+  let routerApi: {
+    generateRouteManifest: (appDir: string, apiDir?: string) => any
+    getMetadataForRoute: (manifest: any, pathname: string) => RouteManifestEntry | null
+    getCssForRoute: (manifest: any, pathname: string) => string[] | null
+  } | null = null
+
+  let routerManifest: any = null
+
+  /**
+   * Optionally minifies, then writes. Single place where output HTML
+   * hits the filesystem, so the minify toggle applies uniformly.
+   */
+  async function writeHtml(outputPath: string, html: string): Promise<void> {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true })
+    const finalHtml = minify ? await minifyHtml(html) : html
+    await fs.writeFile(outputPath, finalHtml)
+  }
 
   return {
     name: 'bini-ssg',
@@ -257,15 +656,34 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
       outDir = options.outputDir || config.build.outDir || 'dist'
     },
 
+    // Capture Vite's emitted CSS per chunk, in memory.
+    // Keys are normalized (forward slashes) so cross-platform lookups match.
+    generateBundle(_options, bundle) {
+      capturedCss = new Map()
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (output.type !== 'chunk') continue
+        const cssFiles = (output as any).viteMetadata?.importedCss as Set<string> | undefined
+        if (!cssFiles || cssFiles.size === 0) continue
+        const modules = Object.keys((output as any).modules ?? {})
+        for (const moduleId of modules) {
+          const key = moduleId.replace(/\\/g, '/')
+          const existing = capturedCss.get(key) ?? []
+          capturedCss.set(key, [...existing, ...cssFiles])
+        }
+      }
+    },
+
     async buildStart() {
       try {
-        const { generateRouteManifest } = await getBiniRouterAPI()
+        routerApi = await getBiniRouterAPI()
+        routerManifest = routerApi.generateRouteManifest(
+          path.join(process.cwd(), appDir),
+        )
 
-        const manifest = generateRouteManifest(path.join(process.cwd(), appDir))
         routeTree = {
-          static: manifest.static || [],
-          dynamic: manifest.dynamic || [],
-          metadata: manifest.metadata || {},
+          static: routerManifest.static || [],
+          dynamic: routerManifest.dynamic || [],
+          metadata: routerManifest.metadata || {},
         }
       } catch (error) {
         const errorMsg = error instanceof Error
@@ -279,7 +697,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
     },
 
     async closeBundle() {
-      // ── Seed routes ────────────────────────────────────────────────────
       const seedRoutes: string[] = [...routeTree.static]
 
       if (includeRoot && !seedRoutes.includes('/')) {
@@ -290,7 +707,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         return
       }
 
-      // ── Load app module + template ─────────────────────────────────────
       try {
         const loadResult = await loadMainModule(config.root)
         if (!loadResult) {
@@ -309,7 +725,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         log.step('Pre-rendering routes')
       }
 
-      // ── Crawl + render loop ────────────────────────────────────────────
       const visited = new Set<string>()
       const queue: Array<{ route: string; depth: number }> = seedRoutes.map(
         (r) => ({ route: r, depth: 0 })
@@ -337,8 +752,22 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
               try {
                 html = await renderRoute(route, mainModule!, htmlTemplate!)
               } catch {
-                // Any render error → silent shell fallback.
                 html = renderShellHtml(htmlTemplate!)
+              }
+
+              // Inject resolved metadata + CSS from bini-router.
+              const api = routerApi
+              const manifest = routerManifest
+              if (api && manifest) {
+                try {
+                  const meta = api.getMetadataForRoute(manifest, route)
+                  if (meta) html = applyMetadataToHtml(html, meta)
+
+                  const css = api.getCssForRoute(manifest, route)
+                  if (css && css.length > 0) html = injectCssLinks(html, css)
+                } catch {
+                  // injection is best-effort; never fail the build over it
+                }
               }
 
               const outputPath =
@@ -347,8 +776,7 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
                   : path.join(outDir, route, 'index.html')
 
               try {
-                await fs.mkdir(path.dirname(outputPath), { recursive: true })
-                await fs.writeFile(outputPath, html)
+                await writeHtml(outputPath, html)
               } catch {
                 failCount++
                 failedRoutes.push(route)
@@ -366,7 +794,6 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
                 console.log(`  ${colors.green}ok${colors.reset}    ${paddedRoute} → ${colors.dim}${relPath}${colors.reset}`)
               }
 
-              // Crawl links from this page (regardless of shell or full).
               if (depth < crawlDepth) {
                 const links = extractInternalLinks(html)
                 for (const link of links) {
@@ -382,6 +809,8 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
       }
 
       // ── Shell fallback for undiscovered dynamic patterns ───────────────
+      // Shells receive the SAME metadata + CSS as crawled routes under the
+      // same pattern, because the pattern's layout chain is stable.
       for (const pattern of routeTree.dynamic) {
         const discovered = [...visited].some((route) =>
           routeMatchesPattern(route, pattern)
@@ -391,11 +820,25 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
           if (visited.has(shellRoute)) continue
           visited.add(shellRoute)
 
-          const shellHtml = renderShellHtml(htmlTemplate!)
+          let shellHtml = renderShellHtml(htmlTemplate!)
+
+          const api = routerApi
+          const manifest = routerManifest
+          if (api && manifest) {
+            try {
+              const meta = api.getMetadataForRoute(manifest, pattern)
+              if (meta) shellHtml = applyMetadataToHtml(shellHtml, meta)
+
+              const css = api.getCssForRoute(manifest, pattern)
+              if (css && css.length > 0) shellHtml = injectCssLinks(shellHtml, css)
+            } catch {
+              // best-effort
+            }
+          }
+
           const outputPath = path.join(outDir, shellRoute, 'index.html')
           try {
-            await fs.mkdir(path.dirname(outputPath), { recursive: true })
-            await fs.writeFile(outputPath, shellHtml)
+            await writeHtml(outputPath, shellHtml)
             successCount++
 
             if (!quiet) {
@@ -421,7 +864,7 @@ export function biniSSG(options: SSGOptions = {}): Plugin {
         try {
           const fallbackHtml = await renderRoute('/404', mainModule, htmlTemplate)
           const fallbackPath = path.join(outDir, '404.html')
-          await fs.writeFile(fallbackPath, fallbackHtml)
+          await writeHtml(fallbackPath, fallbackHtml)
         } catch {
           failCount++
           hasFatalError = true

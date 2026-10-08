@@ -1,6 +1,6 @@
 {
   "name": "bini-ssg",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "True SSG for Bini.js with zero code changes — auto-discovers dynamic routes and pre-renders them to static HTML during vite build",
   "type": "module",
   "sideEffects": false,
@@ -9,8 +9,8 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
@@ -52,27 +52,41 @@
   },
   "dependencies": {
     "html-minifier-terser": "^7.2.0",
-    "node-html-parser": "^9.0.4",
-    "p-limit": "^7.0.0"
+    "node-html-parser": "^9.0.4"
   },
   "peerDependencies": {
     "bini-router": ">=2.0.0",
     "react": ">=18",
     "react-dom": ">=18",
     "react-router-dom": ">=6",
-    "tsx": "^4.0.0",
     "vite": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "bini-router": {
+      "optional": false
+    },
+    "react": {
+      "optional": false
+    },
+    "react-dom": {
+      "optional": false
+    },
+    "react-router-dom": {
+      "optional": false
+    },
+    "vite": {
+      "optional": false
+    }
   },
   "devDependencies": {
     "@types/html-minifier-terser": "^7.0.2",
     "@types/node": "^20.19.43",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
-    "bini-router": "2.1.1",
+    "bini-router": "^2.1.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tsup": "^8.5.1",
-    "tsx": "^4.23.11",
     "typescript": "^6.0.0",
     "vite": "^8.2.1"
   }

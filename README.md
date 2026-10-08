@@ -1,6 +1,8 @@
+<div align="center">
+
 # bini-ssg
 
-<div align="center">
+
 
 [![npm version](https://img.shields.io/npm/v/bini-ssg?color=00CFFF&labelColor=0a0a0a&style=flat-square)](https://www.npmjs.com/package/bini-ssg)
 [![license](https://img.shields.io/badge/license-MIT-00CFFF?labelColor=0a0a0a&style=flat-square)](./LICENSE)
@@ -8,10 +10,9 @@
 [![react](https://img.shields.io/badge/react-18%2B-61dafb?labelColor=0a0a0a&style=flat-square)](https://react.dev)
 [![typescript](https://img.shields.io/badge/typescript-ready-3178c6?labelColor=0a0a0a&style=flat-square)](https://www.typescriptlang.org)
 
-**Static site generation for Bini.js — pre-renders your routes to HTML during `vite build`.**
+**Static site generation for Bini.js: pre-renders your routes to HTML after a client build and an SSR build.**
 
-Route discovery, link crawling, metadata/CSS injection, and shell fallbacks in a single Vite build plugin.
-No dev-server changes and no separate CLI.
+Route discovery, link crawling, head and CSS injection, shell fallbacks, a `404.html`, and minification in a single Vite plugin.
 
 </div>
 
@@ -20,7 +21,6 @@ No dev-server changes and no separate CLI.
 ## Table of contents
 
 - [Features](#features)
-- [What's new in 2.0](#whats-new-in-20)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -28,12 +28,13 @@ No dev-server changes and no separate CLI.
 - [Implementing `render()`](#implementing-render)
 - [Client entry and hydration](#client-entry-and-hydration)
 - [Route discovery and crawling](#route-discovery-and-crawling)
-- [Metadata and CSS injection](#metadata-and-css-injection)
-- [HTML minification](#html-minification)
-- [Options](#options)
+- [Metadata and head injection](#metadata-and-head-injection)
+- [Route-scoped CSS](#route-scoped-css)
+- [HTML template and minification](#html-template-and-minification)
+- [404 page](#404-page)
+- [Configuration](#configuration)
 - [Output layout](#output-layout)
-- [HTML template merging](#html-template-merging)
-- [Node runtime details](#node-runtime-details)
+- [Programmatic API](#programmatic-api)
 - [Hosting notes](#hosting-notes)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -42,79 +43,82 @@ No dev-server changes and no separate CLI.
 
 ## Features
 
-- **Build-only plugin** — runs at `apply: 'build'`; it never touches `vite dev`.
-- **Automatic route discovery** — static routes come straight from `bini-router`'s `generateRouteManifest()`.
-- **Link crawling** — internal `<a href>` links found in rendered HTML are followed (up to `crawlDepth`), so dynamic URLs such as `/blog/hello-world` are fully pre-rendered whenever your pages link to them. Extraction is parser-based (via `node-html-parser`), so it decodes HTML entities and resolves against `<base href>` correctly rather than pattern-matching raw markup.
-- **Shell fallback for dynamic patterns** — any dynamic pattern (`/blog/:slug`, `/docs/*`) that no crawled link matched still gets a client-rendered shell page, so it resolves to a real file on static hosts.
-- **Real asset tags preserved** — output is built from Vite's own `dist/index.html`, so hashed CSS/JS tags stay intact.
-- **Per-route SEO metadata injection** — title, description, robots, canonical/manifest links, icons, Open Graph, and Twitter card tags are pulled from `bini-router`'s route metadata (`getMetadataForRoute`) and merged into each page's `<head>`, overwriting only the tags it knows about.
-- **Structured `document.head` support** — arbitrary head content authored through `bini-router` (as a typed node tree, not raw strings) is serialized to HTML in exactly one place, with all text/attribute escaping centralized there. A `{ t: 'raw' }` node is the explicit, greppable opt-in for authors who need to inject unescaped markup (e.g. JSON-LD).
-- **Route-scoped CSS injection** — CSS modules imported by a specific route (via `bini-router`'s `getCssForRoute`) are resolved to their hashed build output (captured from Vite's `generateBundle`) and injected as `<link rel="stylesheet">` tags on that route's page, deduplicated across shared imports.
-- **Parser-based HTML merging** — the template is handled by [`node-html-parser`](https://www.npmjs.com/package/node-html-parser), so `<script>`/`<style>` content, comments, and nested markup can't throw off `#root` replacement or metadata injection.
-- **Hydration-safe minification** — pre-rendered HTML is minified with [`html-minifier-terser`](https://www.npmjs.com/package/html-minifier-terser) by default, using a conservative whitespace-collapse configuration tuned to avoid React hydration mismatches. Toggle with `minify: false`.
-- **Resilient rendering** — if `render()` throws for a route, that route falls back to a shell page and the build continues.
-- **CI-friendly** — `failOnError` (default `true`) fails the build on discovery, module-load, and write errors.
-- **Configurable concurrency** — sequential by default; opt in to parallel rendering via [`p-limit`](https://www.npmjs.com/package/p-limit).
-- **Zero-config CSS/asset handling** — style and asset imports are stubbed out during the Node render pass, so `render()` can import your app's real component tree without a bundler.
+- **Build-only plugin.** Registered with `apply: 'build'`; it never touches `vite dev`.
+- **Automatic route discovery.** Static routes come from `bini-router`'s `generateRouteManifest()`.
+- **Link crawling.** Internal `<a href>` links in rendered HTML are followed, so dynamic URLs such as `/blog/hello-world` are fully pre-rendered whenever a rendered page links to them. Links are extracted with `node-html-parser`.
+- **Shell fallback for dynamic patterns.** A dynamic pattern (`/blog/:slug`, `/docs/*`) that no rendered URL matched gets a client-rendered shell page at its parent path, when that parent was not already rendered.
+- **Vite-built SSR bundle.** `render()` runs from a real Vite SSR build of your entry, so CSS, asset, and `import.meta.env` handling is the same as in your client build. No `tsx` and no loader hooks.
+- **Per-route head injection.** Title, description, robots, author, keywords, theme color, canonical and manifest links, icons, Open Graph, Twitter tags, and `document.head` content come from `bini-router`'s route manifest.
+- **`document` attributes.** `document.html` and `document.body` attributes are applied to the `<html>` and `<body>` elements.
+- **Route-scoped CSS.** CSS imported by a route's page and layouts is resolved to its hashed build output and linked on that route's page.
+- **Real asset tags preserved.** Pages are built from Vite's own `dist/index.html`, so hashed CSS and JS tags stay intact.
+- **`prerender = false`.** Routes that export `prerender = false` are skipped.
+- **Hydration-safe minification.** Pages are minified with `html-minifier-terser` using a conservative configuration (comments are kept so React's markers survive).
+- **Resilient rendering.** If `render()` throws for a route, that route falls back to a shell page and the build continues.
+- **CI-friendly.** File write failures fail the build; a missing template, SSR bundle, or `render` export throws.
+- **Zero configuration.** `biniSSG()` takes no options.
 
-> `bini-ssg` does **not** supply a `render()` implementation. You export one from `src/main.*` — see [Implementing `render()`](#implementing-render).
-
----
-
-## What's new in 2.0
-
-Compared with the 1.x releases:
-
-- **Link crawling.** Internal links in rendered pages are followed up to the new `crawlDepth` option (default `3`). Dynamic URLs that your pages link to are now pre-rendered as full pages instead of shells.
-- **Smarter shell fallback.** Shell pages are now written only for dynamic patterns that no rendered URL matched. `render()` is still never called for shells.
-- **Per-route metadata and CSS injection.** `bini-router`'s route metadata (title, description, Open Graph/Twitter tags, icons, structured `document.head` content) and route-scoped CSS imports are now merged into every pre-rendered and shell page automatically.
-- **Built-in HTML minification.** Output is minified by default with a hydration-safe configuration; disable via `minify: false`.
-- **Real HTML parsing throughout.** `#root` replacement, metadata merging, and link extraction for crawling all moved to `node-html-parser` instead of hand-rolled regexes. The known `</div>`-inside-`<script>` edge case, and the older link extractor's blind spots around entity-encoded/unquoted `href` values and `<base href>`, no longer apply.
-- **Lighter dependencies.** Runtime dependencies are now `node-html-parser`, `p-limit`, and `html-minifier-terser`; `jsdom` is gone.
-- **Clean process exit.** After a successful run the plugin calls `process.exit(0)` so the build can't hang on leftover loader-hook threads (see [Node runtime details](#node-runtime-details)).
+> `bini-ssg` does **not** supply a `render()` implementation. You export one from `src/main.*`; see [Implementing `render()`](#implementing-render).
 
 ---
 
 ## How it works
 
-After Vite finishes its normal client bundle, `bini-ssg` runs in `closeBundle` (with some bookkeeping in earlier hooks):
+Pre-rendering needs two Vite builds, run in this order:
 
-1. **Capture CSS** (`generateBundle`) — records, per source module, which hashed CSS files Vite emitted for it. This is what later lets route-scoped CSS imports be resolved to real output URLs.
-2. **Discover** (`buildStart`) — reads `manifest.static` and `manifest.dynamic` from `bini-router`'s `generateRouteManifest()`.
-3. **Seed** — starts from every static route, plus `/` when `includeRoot` is enabled.
-4. **Load** — imports `src/main.{tsx,jsx,ts,js}` in Node via `tsx` and reads `<outDir>/index.html` as the HTML template.
-5. **Render + crawl** — calls `render(route)` for each queued route, merges the result into the template, applies that route's metadata (`getMetadataForRoute`) and CSS (`getCssForRoute`) from `bini-router`, writes `<route>/index.html`, then extracts internal links from the rendered HTML and queues any it hasn't seen (until `crawlDepth` is reached).
-6. **Shell fallback** — for each dynamic pattern that no rendered URL matched, writes a shell page at the pattern's `[param]` path, with the same metadata/CSS injection applied.
-7. **Optional `404.html`** — rendered when `fallback: true`.
-8. **Minify + write** — each page is optionally minified, then written to disk.
-9. **Exit** — once finished, the plugin calls `process.exit(0)` (see [Node runtime details](#node-runtime-details)).
+```bash
+vite build                      # 1. client build
+vite build --ssr src/main.tsx   # 2. SSR build, then pre-rendering runs
+```
 
-The result is static, crawlable, metadata-complete HTML for every reachable route (good for SEO and first paint), while your app still ships as a normal client-side React bundle.
+**Client build.** Vite writes `dist/index.html` and your assets. In `generateBundle` the plugin also records which hashed CSS files each source module ended up importing and emits that map as `dist/.bini/css-map.json`.
+
+**SSR build.** The plugin redirects the SSR output to `dist/.bini/server` (without emptying `dist`, copying `public/`, or emitting assets) and names the entry `main.js`. When that build closes successfully, the plugin runs the pre-render step:
+
+1. Reads `dist/index.html` as the template. It must contain an element with `id="root"`.
+2. Loads `bini-router` and calls `generateRouteManifest('src/app')`.
+3. Imports the SSR bundle (`dist/.bini/server/main.js`) and checks that it exports `render()`.
+4. **Seeds** the queue with every static route (except those with `prerender = false`), plus `/`.
+5. **Renders and crawls.** For each queued route it calls `render(route)`, merges the HTML into the template, applies that route's metadata and CSS, minifies, and writes `<route>/index.html`. Internal links found in the rendered HTML are queued.
+6. **Shell fallback.** Writes shell pages for dynamic patterns that no rendered URL matched.
+7. **404.** Writes `dist/404.html`.
+8. **Cleanup.** Deletes `dist/.bini` (the SSR bundle and CSS map) when every page was written successfully.
+
+The result is static, crawlable, metadata-complete HTML for every reachable route, while the app still ships as a normal client-side React bundle.
+
+Wire both builds into one script:
+
+```json
+{
+  "scripts": {
+    "build": "vite build && vite build --ssr src/main.tsx"
+  }
+}
+```
 
 ---
 
 ## Requirements
 
-| Dependency | Version | Notes |
-| --- | --- | --- |
-| Node.js | `>=18` (18.19+ / 20.6+ recommended) | Uses `module.register()` for loader hooks |
-| Vite | `^8.0.0` | Peer dependency |
-| `bini-router` | `>=2.0.0` | **Required** — there is no fallback route scanner, and route metadata/CSS resolution both come from it |
-| `react`, `react-dom` | `>=18` | Peer dependencies |
-| `react-router-dom` | `>=6` | Peer dependency |
-| `tsx` | `^4.0.0` | **Required** — loads your TS/JSX entry in Node, even in JS-only projects |
+| Dependency | Notes |
+| --- | --- |
+| Node.js | Whatever your Vite 8 release requires |
+| Vite | `^8.0.0` (peer dependency) |
+| `bini-router` | **Required.** It must export `generateRouteManifest`, `getMetadataForRoute`, and `getCssForRoute`, and record the `prerender` export in manifest entries. There is no fallback route scanner |
+| `react`, `react-dom` | 18 or later. The example entry uses `renderToPipeableStream` |
+| `react-router-dom` | A version with the data-router static APIs (`createStaticHandler`, `createStaticRouter`, `StaticRouterProvider`). The example entry imports all three from `react-router-dom`, which matches v7 |
 
-`node-html-parser`, `p-limit`, and `html-minifier-terser` are regular dependencies and are installed automatically.
+`node-html-parser` and `html-minifier-terser` are regular dependencies and install automatically.
 
 ---
 
 ## Installation
 
 ```bash
-npm install --save-dev bini-ssg tsx
+npm install --save-dev bini-ssg
 ```
 
-`bini-router` must already be installed and configured; `bini-ssg` imports it at build time to discover routes and read per-route metadata/CSS. `react`, `react-dom`, and `react-router-dom` are expected to be present as part of your bini-router app.
+`bini-router` must already be installed and configured; `bini-ssg` imports it at build time to discover routes and read per-route metadata and CSS.
 
 ---
 
@@ -134,21 +138,21 @@ export default defineConfig({
   plugins: [
     react(),
     biniEnv(),
-    ...biniroute(),
+    biniroute(),
     biniSSG(),
   ],
 })
 ```
 
-**2. Export `render()` from your entry** — see the next section.
+**2. Export `render()` from your entry.** See the next section.
 
 **3. Build**
 
 ```bash
-vite build
+vite build && vite build --ssr src/main.tsx
 ```
 
-Pre-rendered HTML is written into your normal `build.outDir` (`dist` by default), next to the rest of your build output. Use `vite preview` to inspect it locally.
+Pre-rendered HTML is written into `dist/`, next to the rest of your build output. Use `vite preview` to inspect it.
 
 Example output:
 
@@ -158,86 +162,187 @@ STEP Pre-rendering routes
   ok    /about        → dist/about/index.html
   ok    /blog         → dist/blog/index.html
   ok    /blog/hello   → dist/blog/hello/index.html
+  ok    404.html      → dist/404.html
 
-SUCCESS Pre-rendered 4 routes
+SUCCESS Pre-rendered 5 routes
   Completed in 1.84s
+
+INFO Output directory: /path/to/project/dist
 ```
 
 ---
 
 ## Implementing `render()`
 
-`bini-ssg` loads `src/main.{tsx,jsx,ts,js}` in Node and calls its `render` export once per route:
+The SSR bundle must export:
 
 ```ts
 export function render(url: string): Promise<string> | string
 ```
 
-- `url` is the route being pre-rendered (e.g. `/`, `/about`, `/blog/hello-world`).
-- The return value (or resolved value) must be an HTML string. It is inserted into `<div id="root">…</div>`.
+- `url` is the route being pre-rendered (`/`, `/about`, `/blog/hello-world`).
+- It must return (or resolve to) an HTML string, which becomes the contents of `<div id="root">`. A non-string result is treated as a failure and the route falls back to a shell page.
 
-A typical implementation with React Router's `StaticRouter`:
+The generated `src/App` from `bini-router` exports `routes` and `basename`, so the natural implementation uses React Router's static handler. This is a complete entry:
 
 ```tsx
 // src/main.tsx
+import React from 'react'
 import { createRoot, hydrateRoot } from 'react-dom/client'
-import App from './App'
+import {
+  matchRoutes,
+  createStaticHandler,
+  createStaticRouter,
+  StaticRouterProvider,
+} from 'react-router-dom'
+import App, { routes, basename as rawBasename } from './App'
 
-declare global {
-  interface Window { __BINI_SHELL__?: boolean }
-}
+const basename: string = rawBasename
 
-// ─── Client mount (browser only) ─────────────────────────────────────
-if (typeof document !== 'undefined') {
-  const container = document.getElementById('root')!
+// ─── Client ──────────────────────────────────────────────────────────────
 
-  if (window.__BINI_SHELL__ || !container.hasChildNodes()) {
-    createRoot(container).render(<App />)   // shell or empty page → plain client render
-  } else {
-    hydrateRoot(container, <App />)         // pre-rendered page → hydrate
-  }
-}
-
-// ─── SSG render (Node only, called by bini-ssg) ──────────────────────
-export async function render(url: string): Promise<string> {
-  const { renderToString } = await import('react-dom/server')
-  const { StaticRouter } = await import('react-router-dom/server')
-  const { AppRoutes } = await import('./App')
-
-  return renderToString(
-    <StaticRouter location={url}>
-      <AppRoutes />
-    </StaticRouter>
+// Routes that use `lazy` must be loaded before hydration, otherwise the router
+// renders its hydrate fallback on first paint and mismatches the server HTML.
+async function preloadLazyRoutes(): Promise<void> {
+  const matches = matchRoutes(routes, window.location, basename) ?? []
+  await Promise.all(
+    matches.map(async (m) => {
+      const lazy = m.route.lazy
+      if (!lazy) return
+      const loaded = await (lazy as () => Promise<Record<string, unknown>>)()
+      Object.assign(m.route, { ...loaded, lazy: undefined })
+    }),
   )
 }
+
+async function mount() {
+  const rootElement = document.getElementById('root')
+  if (!rootElement) return
+
+  const isShell =
+    (window as typeof window & { __BINI_SHELL__?: boolean }).__BINI_SHELL__ === true
+
+  // shell or dev: there is no server-rendered HTML to hydrate
+  if (isShell || import.meta.env.DEV) {
+    createRoot(rootElement).render(<App />)
+    return
+  }
+
+  await preloadLazyRoutes()
+  hydrateRoot(rootElement, <App />)
+}
+
+if (typeof window !== 'undefined') {
+  void mount()
+}
+
+// ─── SSR (called by bini-ssg) ────────────────────────────────────────────
+
+function normalizeUrl(url: string): string {
+  const normalizedBase = basename === '/' ? '' : basename.replace(/\/$/, '')
+  const routePath = url.startsWith('/') ? url : `/${url}`
+
+  if (
+    normalizedBase &&
+    !routePath.startsWith(`${normalizedBase}/`) &&
+    routePath !== normalizedBase
+  ) {
+    return `${normalizedBase}${routePath}`
+  }
+  return routePath
+}
+
+let handler: ReturnType<typeof createStaticHandler> | undefined
+
+export async function render(url: string): Promise<string> {
+  const { renderToPipeableStream } = await import('react-dom/server')
+  const { Writable } = await import('node:stream')
+
+  handler ??= createStaticHandler(routes, { basename })
+
+  const request = new Request(new URL(normalizeUrl(url), 'http://localhost'))
+  const context = await handler.query(request)
+
+  // a loader redirected (or returned a raw Response): there is no page to render
+  if (context instanceof Response) {
+    throw new Error(`${url} responded with ${context.status}`)
+  }
+
+  // 404 is fine (the 404.html probe relies on it); loader failures are not
+  if (context.statusCode >= 500) {
+    throw new Error(`${url} failed with status ${context.statusCode}`)
+  }
+
+  const router = createStaticRouter(handler.dataRoutes, context)
+
+  return new Promise((resolve, reject) => {
+    let html = ''
+    let didError = false
+
+    const writable = new Writable({
+      write(chunk, _encoding, callback) {
+        html += chunk.toString()
+        callback()
+      },
+    })
+
+    const { pipe } = renderToPipeableStream(
+      // hydrate defaults to true: this writes window.__staticRouterHydrationData,
+      // which createBrowserRouter in App.getRouter() reads, so loaders don't re-run
+      <StaticRouterProvider router={router} context={context} />,
+      {
+        onAllReady() {
+          pipe(writable)
+          writable.once('finish', () => {
+            if (didError) {
+              reject(new Error('Bini.js SSR rendering failed.'))
+              return
+            }
+            resolve(html)
+          })
+        },
+        onShellError(error) {
+          reject(error)
+        },
+        onError(error) {
+          didError = true
+          console.error('[Bini.js SSR]', error)
+        },
+      },
+    )
+  })
+}
+
+export { App }
 ```
 
-This module executes in two environments: the browser (mount code) and Node via `tsx` (the `render()` export). Because your entry is imported in Node, anything that touches `window`/`document` at module scope must be guarded, as shown above.
+Notes:
 
-### Keep `render()` pure
-
-By default (`concurrency: 1`) routes render sequentially in the **same Node process and the same loaded module**. Module-scope state — stores created outside components, in-memory caches, counters — persists between routes and can leak from one page into another. Keep the output of `render()` a pure function of `url`.
+- On React Router v6, import `createStaticRouter` and `StaticRouterProvider` from `react-router-dom/server` instead.
+- `onAllReady` waits for every Suspense boundary, so lazy pages are fully rendered into the HTML.
+- The entry runs in the browser (the mount code) and in Node (`render()`), so guard anything that touches `window` or `document` at module scope.
+- `render()` runs for every route in the **same loaded module**. Module-scope state (stores, caches, the cached `handler` above) is shared between routes, so keep the output a pure function of `url`.
 
 ---
 
 ## Client entry and hydration
 
-`bini-ssg` writes two kinds of pages, and your client entry must treat them differently:
+`bini-ssg` writes two kinds of pages, and the client entry must treat them differently:
 
 | Page type | `#root` contents | Client should |
 | --- | --- | --- |
-| Pre-rendered (static routes and crawled URLs) | Full server-rendered HTML | `hydrateRoot(...)` |
-| Shell (undiscovered dynamic patterns, or a route whose `render()` threw) | Empty | `createRoot(...).render(...)` |
+| Pre-rendered (static routes, crawled URLs, `404.html`) | Server-rendered HTML | `hydrateRoot(...)` |
+| Shell (undiscovered dynamic patterns, or a route whose `render()` failed) | Empty | `createRoot(...).render(...)` |
 
-Shell pages get this marker injected into `<head>` (or right after `<body>` if there is no `<head>`):
+Shell pages get this marker appended to `<head>`:
 
 ```html
 <script>window.__BINI_SHELL__=true;</script>
 ```
 
-The marker is a plain inline script, not part of your `type="module"` entry, so it runs synchronously during parsing and is guaranteed to be set before your entry checks it. Without it, React would try to hydrate an empty `#root` and throw a hydration mismatch (error #418).
+It is a plain inline script, not part of your `type="module"` entry, so it runs before the entry and the flag is set when the entry checks it. Without it React would try to hydrate an empty `#root` and throw a hydration mismatch (error #418).
 
-`bini-ssg` only sets the flag. Your `src/main.*` is responsible for branching on it, as in the example above.
+`bini-ssg` only sets the flag. Your entry decides what to do with it, as in the example above. The marker is only added when the template has a `<head>`.
 
 ---
 
@@ -245,200 +350,203 @@ The marker is a plain inline script, not part of your `type="module"` entry, so 
 
 ### Seeds
 
-Routes come entirely from `bini-router`:
+Routes come from `bini-router`:
 
 ```ts
-const manifest = generateRouteManifest(appDir)
+const manifest = generateRouteManifest('src/app')
 ```
 
-- **`manifest.static`** — routes with no `:param` or `*` segments — seed the render queue automatically.
-- **`includeRoot`** adds `/` to the seeds when it isn't already present.
-- **`manifest.dynamic`** — routes containing `:param` or `*` — can't be enumerated by `bini-ssg` on its own. They are handled by crawling and shell fallback, below.
+- **`manifest.static`** routes (no `:param` or `*` segments) seed the queue, except those exporting `prerender = false`.
+- **`/`** is always added when it is not already a seed, even if its page exports `prerender = false`.
+- **`manifest.dynamic`** routes can't be enumerated by `bini-ssg` and are handled by crawling and shell fallback.
+
+### `prerender` export
+
+A page can opt out:
+
+```ts
+// src/app/admin/page.tsx
+export const prerender = false
+```
+
+- `false`: the route is not seeded, links to it are not followed, and a dynamic pattern with `false` gets no shell page.
+- `'strict'` and `'fallback'`: accepted, and currently behave the same as leaving the export out.
+- Any other value is reported with a warning and treated as unset.
 
 ### Link crawling
 
-Every page that is written has its rendered HTML scanned for `<a href>` links. New internal links are queued and rendered with `render(link)`, up to `crawlDepth` levels away from a seed.
+Every written page has its rendered HTML scanned for `<a href>` links. New internal links are queued and rendered with `render(link)`. There is no depth limit; each URL is rendered at most once, and pages are processed one at a time.
 
-Given a static `/blog` page whose rendered HTML links to `/blog/hello-world` and `/blog/second-post`, both URLs are pre-rendered as full pages — no shell involved.
+Given a static `/blog` page whose HTML links to `/blog/hello-world` and `/blog/second-post`, both URLs are pre-rendered as full pages.
 
-Extraction runs through [`node-html-parser`](https://www.npmjs.com/package/node-html-parser) — the same parser used everywhere else in the plugin — rather than a regex, so it correctly handles:
-
-- HTML entities in `href` values (`&amp;` decodes to `&`)
-- single-quoted, double-quoted, and unquoted attribute values
-- attribute values that themselves contain `>` or `<`
-- an `<a>` sitting inside a `<script>` block or an HTML comment (ignored, since the parser understands raw-text and comment regions)
-- a `<base href>` in the document, which relative links are resolved against before being queued
+Links are resolved against `<base href>` (or `/`), have query strings and hashes stripped, have `.`/`..` segments and repeated slashes collapsed, and lose any trailing slash.
 
 Links are **ignored** when they are:
 
 - external (`https://…`), protocol-relative (`//…`), `mailto:`, `tel:`, or `javascript:`
 - hash-only (`#section`)
 - under `/assets/`, `/_next/`, or `/static/`
-- file references by extension (images, fonts, media, `.css`, `.js`, `.mjs`, `.map`, `.json`, `.xml`, `.txt`, `.pdf`, …)
-
-Discovered links are normalized before queuing: relative paths are resolved against `<base href>` (or `/` if there is none), `..`/`.` segments and repeated slashes are collapsed, query strings and hashes are stripped, and trailing slashes are removed. Each resolved URL is rendered at most once.
-
-Set `crawlDepth: 0` to render only the seed routes and disable crawling.
+- file references with one of these extensions: `png`, `jpg`, `jpeg`, `gif`, `svg`, `webp`, `avif`, `ico`, `css`, `js`, `mjs`, `map`, `woff`, `woff2`, `ttf`, `eot`, `mp4`, `webm`, `mp3`, `wav`, `pdf`, `xml`, `txt`, `json`
+- routes whose metadata says `prerender = false`
 
 ### Shell fallback
 
-After crawling, each pattern in `manifest.dynamic` is checked against the URLs that were actually rendered. If **no** rendered URL matches a pattern, `bini-ssg` writes a shell page for it:
+After crawling, each dynamic pattern is checked against the URLs that were rendered. If none matches, `bini-ssg` writes a shell page at the pattern's **parent path**:
 
 ```text
-/blog/:slug  →  /blog/[slug]/index.html
-/docs/*      →  /docs/[...slug]/index.html
+/blog/:slug  →  /blog/index.html
+/docs/*      →  /docs/index.html
 ```
 
-A shell is your built `index.html` template with the `__BINI_SHELL__` marker added; `render()` is not called for it. The client app takes over on load and fetches or renders the real content. Shells still receive the same metadata and CSS injection as crawled routes under the same pattern (see below), since the pattern's layout chain is stable regardless of whether a specific URL under it was discovered.
+A shell is the built `index.html` with the `__BINI_SHELL__` marker; `render()` is not called for it. It gets the metadata and CSS of the parent route.
 
-If at least one crawled URL matched the pattern (e.g. `/blog/hello-world` for `/blog/:slug`), no shell is written for that pattern.
+A shell is skipped when:
+
+- some crawled URL matched the pattern (for example `/blog/hello-world` for `/blog/:slug`)
+- the parent path was already rendered (for example `/blog` is a real page, so it is left as is)
+- the parent path itself contains a dynamic segment
+- the pattern exports `prerender = false`
 
 ### What crawling can and can't see
 
-- Crawling only sees links present in the **server-rendered HTML** returned by `render()`. Links that appear only after client-side data fetching are not discovered.
-- Any internal link is rendered, whether or not it maps to a known route. A link to a URL your app doesn't recognize will be written as whatever your app renders for it (typically your not-found view).
-- To pre-render a dynamic URL, make sure some rendered page links to it — for example, an index page listing every post.
+- Crawling only sees links in the server-rendered HTML returned by `render()`. Links added after client-side data fetching are not found.
+- Any internal link is rendered, whether or not it maps to a known route. A link to an unknown URL is written as whatever your app renders for it, typically the not-found view.
+- To pre-render a dynamic URL, make sure some rendered page links to it, for example an index page listing every post.
 
 ---
 
-## Metadata and CSS injection
+## Metadata and head injection
 
-Once a page's HTML is rendered and merged into the template, `bini-ssg` asks `bini-router` for that route's metadata and CSS, and applies both before the file is written. This runs for crawled/pre-rendered pages and for shell pages alike, and is best-effort — a failure here never fails the build.
+For every page (pre-rendered, shell, and `404.html`), `bini-ssg` calls `getMetadataForRoute(manifest, route)` and merges the result into the page's `<head>`. Looking up metadata is best-effort: if `bini-router` throws, the page is written without it.
 
-`bini-ssg` only ever *consumes* metadata — it never invents it. The metadata itself is authored against `bini-router`'s route metadata API (in your route/layout files) and resolved by `generateRouteManifest()`; `bini-ssg` calls `getMetadataForRoute(manifest, route)` at write time and merges whatever comes back. See `bini-router`'s docs for the authoring API itself; this section only documents the shape `bini-ssg` knows how to apply.
+`bini-ssg` only consumes metadata. You author it with `export const metadata` in your pages and layouts, and `bini-router` merges it along the layout chain.
 
-### Defining metadata for a route
-
-A route (or layout) exports a `metadata` object matching `RouteManifestEntry`. Anything you don't set is simply left out of the merge — existing tags in your `index.html` template are untouched.
-
-```ts
-// src/app/blog/[slug]/route.tsx
+```tsx
+// src/app/blog/page.tsx
 export const metadata = {
-  title: 'How bini-ssg pre-renders routes',
-  meta: {
-    description: 'A look at link crawling, shells, and metadata injection.',
-    robots: 'index, follow',
-    author: 'Binidu Ranasinghe',
-    keywords: ['ssg', 'vite', 'react'],
-    canonical: 'https://example.com/blog/how-bini-ssg-works',
-    themeColor: '#0a0a0a',
-    icons: {
-      icon: [{ url: '/favicon.ico', sizes: '32x32' }],
-      apple: [{ url: '/apple-touch-icon.png', sizes: '180x180' }],
-    },
-    openGraph: {
-      title: 'How bini-ssg pre-renders routes',
-      description: 'A look at link crawling, shells, and metadata injection.',
-      type: 'article',
-      url: 'https://example.com/blog/how-bini-ssg-works',
-      image: 'https://example.com/og/how-bini-ssg-works.png',
-    },
-    twitter: {
-      card: 'summary_large_image',
-      title: 'How bini-ssg pre-renders routes',
-      description: 'A look at link crawling, shells, and metadata injection.',
-      image: 'https://example.com/og/how-bini-ssg-works.png',
-      creator: '@bini_js',
-    },
+  title: 'Blog',
+  description: 'Notes on routing, SSG, and Vite.',
+  robots: 'index, follow',
+  author: 'Binidu Ranasinghe',
+  keywords: ['ssg', 'vite', 'react'],
+  canonical: 'https://example.com/blog',
+  themeColor: '#0a0a0a',
+  icons: {
+    icon: [{ url: '/favicon.ico', sizes: '32x32' }],
+    apple: [{ url: '/apple-touch-icon.png', sizes: '180x180' }],
+  },
+  openGraph: {
+    title: 'Blog',
+    description: 'Notes on routing, SSG, and Vite.',
+    type: 'website',
+    url: 'https://example.com/blog',
+    images: [{ url: 'https://example.com/og/blog.png', width: 1200, height: 630, alt: 'Blog' }],
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'Blog',
+    creator: '@bini_js',
+    images: ['https://example.com/og/blog.png'],
   },
 }
 ```
 
-For **dynamic routes** (`/blog/:slug`), the metadata function/object is keyed by the route's pattern, not by each resolved URL — every crawled URL under that pattern, and the pattern's shell fallback if it's never discovered, receive the same metadata. If you need per-URL metadata (a different title for each blog post, for example), resolve it inside your `render()` implementation instead and write it directly into the HTML you return — `bini-ssg` will not overwrite tags that are already present and match a `name`/`property`/`rel` it manages, but it also won't remove or dedupe tags your own render pass adds beyond that set.
+### Keys applied
 
-Layout-level metadata (set in a parent layout) is merged by `bini-router` before `bini-ssg` ever sees it — `getMetadataForRoute` returns the already-merged entry for a given route, so `bini-ssg` has no separate notion of layout inheritance.
+| Key | Output |
+| --- | --- |
+| `title` | `<title>` (updated in place, or inserted at the start of `<head>`) |
+| `description`, `robots`, `author` (string), `keywords` (string, or array joined with `, `) | `<meta name="…">` |
+| `themeColor` | `<meta name="theme-color">` |
+| `canonical`, `manifest` | `<link rel="canonical">`, `<link rel="manifest">` |
+| `icons.icon`, `icons.shortcut`, `icons.apple` | `<link rel="icon">`, `<link rel="shortcut icon">`, `<link rel="apple-touch-icon">`. `icon` and `apple` entries also carry `type` and `sizes` |
+| `openGraph` | Only when `openGraph.title` is set: `og:title`, `og:type` (default `website`), `og:description`, `og:url`, `og:site_name` (from `siteName`), and one `og:image` per entry of `images` (strings or `{ url, width, height, alt }`) or from `image` |
+| `twitter` | Only when `twitter.title` is set: `twitter:card` (default `summary_large_image`), `twitter:title`, `twitter:description`, `twitter:creator`, and `twitter:image` from the first of `images` or `image` |
 
-### SEO metadata
+Rules:
 
-`getMetadataForRoute(manifest, route)` returns an entry describing the route. `bini-ssg` uses it to set, without disturbing anything else already in `<head>`:
+- Existing `<meta name|property>` and `<link rel>` tags that match are updated in place. Keys with no value leave the template untouched.
+- `og:image` (and its width, height, and alt) tags are always appended, not deduplicated against existing ones.
+- Other metadata keys are ignored.
+- Metadata is keyed by route **pattern**. Every crawled URL under `/blog/:slug` gets the same tags. For per-URL tags (a different title per post), put them in the HTML your `render()` returns; `bini-ssg` won't remove tags you add beyond the ones it manages.
 
-- `<title>` (top-level `title`, falling back to `meta.title`)
-- `<meta name="description">`, `theme-color`, `robots`, `author`, `keywords` (accepts a string or an array, joined with `, `)
-- `<link rel="canonical">` and `<link rel="manifest">`
-- Icons: `<link rel="icon">`, `<link rel="shortcut icon">`, and `<link rel="apple-touch-icon">`, each with `type`/`sizes` when provided
-- Open Graph tags (`og:title`, `og:type`, `og:description`, `og:url`, `og:image`) once a title is present
-- Twitter card tags (`twitter:card`, `twitter:title`, `twitter:description`, `twitter:creator`, `twitter:image`) once a title is present
+### `document` export
 
-Existing tags matching the same `name`/`property`/`rel` are updated in place rather than duplicated; tags with no corresponding metadata are left untouched.
+If the route (or its nearest layout) has an `export const document`, `bini-ssg` also applies:
 
-### Structured `document.head` content
+- `document.html` and `document.body`: string attributes set on `<html>` and `<body>`. Existing attributes with the same name are **overwritten**, including `class`.
+- `document.head`: the node tree is serialized to HTML and appended to the end of `<head>`. Elements get escaped attributes and text; void elements (`meta`, `link`, `img`, …) have no closing tag; attributes with an empty value are written bare (`async`). A `{ t: 'raw', value }` node is inserted verbatim. `bini-router` does not currently emit raw nodes from JSX; the type exists for trees built another way.
 
-Metadata entries can also carry a `document.head` node tree (produced by `bini-router`, not raw HTML strings). `bini-ssg` is the only place this tree is turned into markup — the router itself never generates HTML. Three node types are supported:
-
-- `{ t: 'element', tag, attrs, children }` — serialized with attribute/text escaping applied
-- `{ t: 'text', value }` — escaped text content
-- `{ t: 'raw', value }` — inserted verbatim; the explicit opt-in for content you've already prepared as HTML (e.g. JSON-LD `<script>` blocks)
-
-`document.html` and `document.body` maps, if present on the metadata entry, are applied as attributes on the `<html>` and `<body>` elements.
-
-### Route-scoped CSS
-
-`getCssForRoute(manifest, route)` returns the source CSS file paths a route depends on (for example, CSS imported by a layout that only some routes use). `bini-ssg` resolves each source path to the hashed output URL(s) Vite emitted for it — using the map captured in `generateBundle` — and injects `<link rel="stylesheet">` tags for them, deduplicated across pages that share the same CSS.
-
-Resolution tries an exact normalized path match first, then falls back to a basename match; both sides of the comparison are normalized to forward slashes and lowercase so this works the same on Windows and POSIX filesystems. If a source path can't be resolved to a build output at all, it's silently skipped rather than failing the page.
+The serializer is exported as `headTreeToHtml(nodes)`.
 
 ---
 
-## HTML minification
+## Route-scoped CSS
 
-By default, every page `bini-ssg` writes — pre-rendered, shell, or `404.html` — is minified with `html-minifier-terser` before it hits disk. The configuration is deliberately conservative:
+`getCssForRoute(manifest, route)` returns the CSS source paths a route imports through its page and layouts. `bini-ssg` maps each source path to the hashed file Vite emitted, using `dist/.bini/css-map.json` from the client build, and adds `<link rel="stylesheet">` tags for them.
 
-- `collapseWhitespace` + `conservativeCollapse` — whitespace is always collapsed to a single space, never removed entirely, which is what keeps text nodes intact for React hydration.
-- `removeComments: false` — preserves React's `<!--$-->` streaming/boundary markers.
-- `sortAttributes: false` / `sortClassName: false` — attribute and class order is left alone, since React compares props/classes during hydration.
-- `minifyCSS` / `minifyJS` — inline `<style>`/`<script>` content is minified too.
-
-If minification throws for a given page (malformed author HTML, for instance), `bini-ssg` ships the original unminified HTML for that page rather than failing the build. A warning is printed to the console the first time this happens in a given build (`[bini-ssg] HTML minification failed; falling back to unminified output. …`), so a systematically broken minifier configuration is still visible — it isn't logged again for every subsequent page.
-
-Set `minify: false` to disable this entirely and write the merged HTML as-is.
+- Matching tries the exact normalized path first, then a basename match (extension ignored) that must be unique. Paths are normalized to forward slashes and lowercase, so this behaves the same on Windows and POSIX.
+- Unresolvable paths are skipped silently.
+- Stylesheets already linked in `<head>` are not added twice.
+- Injected `href`s are root-absolute (`/assets/…`) and do not include Vite's `base`.
+- If `css-map.json` is missing, a warning is printed and no route-scoped CSS is injected.
 
 ---
 
-## Options
+## HTML template and minification
 
-```ts
-biniSSG({
-  appDir      : 'src/app',
-  outputDir   : undefined,
-  includeRoot : true,
-  fallback    : false,
-  crawlDepth  : 3,
-  concurrency : 1,
-  failOnError : true,
-  quiet       : false,
-  verbose     : true,
-  minify      : true,
-})
-```
+`bini-ssg` reads `dist/index.html`, the file the client build just produced with its hashed CSS and JS tags, and parses it with `node-html-parser`. The template must contain an element with `id="root"`; if it does not, pre-rendering throws.
 
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `appDir` | `string` | `'src/app'` | Directory passed to `bini-router`'s `generateRouteManifest()`, resolved from `process.cwd()`. |
-| `outputDir` | `string` | Vite `build.outDir` (`dist`) | Where pre-rendered HTML is written. |
-| `includeRoot` | `boolean` | `true` | Seed `/` even if `bini-router` didn't report it. Set `false` if `/` is handled another way (e.g. it is itself a dynamic route). |
-| `fallback` | `boolean` | `false` | Also render `/404` and write it to `<outDir>/404.html`, for hosts that serve a static 404 page (Netlify, GitHub Pages). Skipped when a static `/404` or `/not-found` route already exists. |
-| `crawlDepth` | `number` | `3` | Maximum link-following depth from the seed routes. `0` disables crawling. |
-| `concurrency` | `number` | `1` | Number of routes processed in parallel (through `p-limit`). Raise it only once you've confirmed `render()` has no shared module-scope state. |
-| `failOnError` | `boolean` | `true` | Fail `vite build` on route discovery, app-module load, or file-write errors. See below. |
-| `quiet` | `boolean` | `false` | Suppress all output. |
-| `verbose` | `boolean` | `true` | Accepted for compatibility. Per-route progress is currently controlled by `quiet`. |
-| `minify` | `boolean` | `true` | Minify each written page with `html-minifier-terser`, using a hydration-safe configuration. See [HTML minification](#html-minification). |
+For each page, the root element's contents are replaced with the rendered HTML (its own attributes are kept), metadata and CSS are applied, and the document is serialized back to a string.
 
-### `failOnError`
+Every page is then minified with `html-minifier-terser` using this fixed configuration:
 
-When `true` (the default), the build exits non-zero for:
+- `collapseWhitespace` with `conservativeCollapse`, so whitespace collapses to a single space and never disappears entirely, which keeps text nodes intact for hydration
+- `removeComments: false`, which preserves React's `<!--$-->` markers
+- `sortAttributes: false` and `sortClassName: false`
+- `removeRedundantAttributes`, `removeEmptyAttributes`, `useShortDoctype`
+- `minifyCSS` and `minifyJS` for inline `<style>` and `<script>`
 
-- **Route discovery failures** — `bini-router` can't be loaded, or its manifest throws (for example a `RouteConflictError` or `CircularLayoutError`). Raised in `buildStart`.
-- **App module failures** — `src/main.*` can't be found, fails to import, or doesn't export `render`. Raised in `closeBundle`, even for projects made up only of dynamic routes.
-- **Write failures** — any route's file can't be written, or `404.html` fails. Reported at the end as `N route(s) failed to pre-render`.
+If minification throws for a page, that page counts as a failed write and the build fails. Minification cannot be turned off.
 
-A `render()` call that **throws** is deliberately *not* one of these: that route falls back to a shell page and the build continues.
+---
 
-Set `failOnError: false` only if you want the plain client-side bundle to ship even when pre-rendering fails outright.
+## 404 page
 
-### `concurrency`
+`dist/404.html` is always written:
 
-Routes are processed one at a time by default. This is the safe choice because every `render()` call runs against a single loaded copy of your app module. Increase it for faster builds only if your app has no module-scope mutable state that could bleed between concurrent renders.
+- If a route `/404` was rendered, its HTML is used.
+- Otherwise `render('/__bini_not_found__')` is called and the result is used. If that throws, a shell page is written instead.
+
+`404.html` is the page for hosts that serve a static not-found file (Netlify, GitHub Pages).
+
+---
+
+## Configuration
+
+`biniSSG()` takes **no options**. Behavior is fixed:
+
+| Setting | Value |
+| --- | --- |
+| Routes directory | `src/app` (relative to `process.cwd()`) |
+| Output directory | `dist` (relative to `process.cwd()`) |
+| SSR entry | `main.js`, built into `dist/.bini/server` |
+| Concurrency | Sequential, one route at a time |
+| Crawl depth | Unlimited |
+| Root route | Always rendered |
+| `404.html` | Always written |
+| Minification | Always on |
+| Fail on error | Always on |
+| Cleanup of `dist/.bini` | On success only |
+| Logging | Always on |
+
+The pre-render step reads and writes `dist/` under the current working directory, so keep Vite's `build.outDir` at its default.
+
+### Failure behavior
+
+- **Build-stopping errors:** `dist/index.html` missing, no `#root` in it, the SSR bundle missing or failing to import, no `render` export, or the bini-router manifest failing to load or scan. These throw.
+- **Write failures:** any page that can't be written (including unsafe route segments and minifier errors) is collected and listed under `FAILED`, and the build then throws. `dist/.bini` is kept in that case.
+- **`render()` failures:** a route whose `render()` throws or returns a non-string is **not** a build failure. It silently becomes a shell page.
 
 ---
 
@@ -452,73 +560,78 @@ dist/
   blog/
     index.html                  ← pre-rendered static route
     hello-world/
-      index.html                ← crawled dynamic URL (fully pre-rendered)
+      index.html                ← crawled dynamic URL
   docs/
-    [...slug]/
-      index.html                ← shell — only when no crawled URL matched /docs/*
-  404.html                      ← only when `fallback: true`
+    index.html                  ← shell, only when /docs/* matched no rendered URL and /docs wasn't rendered
+  404.html
   assets/                       ← your normal Vite JS/CSS output, unchanged
+  .bini/                        ← SSR bundle and css-map.json; removed after a successful run
 ```
 
-Routes are deduplicated before rendering, so a route reachable through several paths (seed, `includeRoot`, multiple links) is rendered and written once.
+Route output paths are built from decoded URL segments. Segments that are `.`, `..`, or contain `\ / : * ? " < > |` or a null byte are rejected, and a route can never write outside `dist`.
 
 ---
 
-## HTML template merging
+## Programmatic API
 
-`bini-ssg` reads `<outDir>/index.html` — the file Vite just produced, already containing your hashed CSS/JS tags — and uses it as the template for every page. The template is parsed with [`node-html-parser`](https://www.npmjs.com/package/node-html-parser), the rendered HTML is inserted, metadata and route CSS are applied, and the document is serialized back to a string before optional minification.
+```ts
+import { biniSSG, prerender, headTreeToHtml } from 'bini-ssg'
+import type { PrerenderResult, HeadNode } from 'bini-ssg'
+```
 
-- If an element with `id="root"` exists, its inner content is replaced with the rendered HTML. The element's own attributes (`class`, `data-*`, …) are kept, and a self-closing `<div id="root" />` is handled too.
-- If there is no `#root`, `<div id="root">…</div>` is inserted at the start of `<body>`.
-- If there is no `<body>` either, the `#root` div is prepended to the document. This only happens with a malformed `index.html`.
-- Raw-text regions such as `<script>` and `<style>`, comments, and the doctype are handled by the parser rather than by pattern matching, so a literal `</div>` inside a `<script>` block in your rendered output no longer breaks the merge.
-- Shell pages get the `__BINI_SHELL__` marker injected first (just before `</head>`, or after `<body>` if there is no head), then the same `#root` handling: an existing `#root` is left as-is, otherwise an empty one is added.
-- If `<outDir>/index.html` doesn't exist when the plugin runs, a minimal built-in HTML document is used instead — you'd lose your real CSS/JS tags for that build. In a normal setup Vite writes `index.html` before `closeBundle`, so this doesn't occur.
-
-Because the document is re-serialized, markup in the template and in your rendered HTML may be lightly normalized (for example an empty nested `<div/>` is written as `<div></div>`). It stays equivalent HTML.
-
----
-
-## Node runtime details
-
-Because `render()` runs in Node and your entry is imported directly (not through Vite's browser bundler), `bini-ssg` registers two loader hooks before importing it:
-
-- **`tsx`** compiles TS/JSX on the fly so Node can import your source. This is why `tsx` is required even in JavaScript projects.
-- **A temporary asset-stub loader** resolves stylesheet imports (`.css`, `.scss`, `.sass`, `.less`, `.styl`) and static asset imports (images, fonts, audio/video) to empty stub modules, so `import './styles.css'` doesn't fail in Node. It only affects the Node-side render pass; your real built CSS/JS — including the hashed files resolved for route-scoped CSS injection — is untouched.
-
-You don't need to configure either. Notes:
-
-- Node loader hooks can't be unregistered once added, so registration happens once per process. The temporary file backing the stub loader is deleted at the end of every build.
-- **Process exit.** After pre-rendering completes successfully, `bini-ssg` calls `process.exit(0)`. `module.register()` starts a loader-hook worker thread that isn't torn down on its own, which can leave the build process hanging on some runtimes (observed on Deno Deploy's Node compatibility layer). If you drive `vite build` from a longer script, or rely on other plugins' `closeBundle` hooks running *after* `bini-ssg`, be aware the process ends here.
-- **`import.meta.env` is not populated during the Node render pass**, because the app module is loaded by `tsx` rather than Vite's pipeline. Code that reads `import.meta.env.*` at module scope (for example initializing a Firebase client on import) can crash pre-rendering. Initialize such clients lazily, or guard them so they only run in the browser.
+| Export | Description |
+| --- | --- |
+| `biniSSG()` (also the default export) | The Vite plugin. Takes no arguments |
+| `prerender(): Promise<PrerenderResult>` | Runs the pre-render step directly against `./dist`. Requires a finished client build and SSR build. The plugin calls this for you |
+| `headTreeToHtml(nodes: HeadNode[]): string` | Serializes a `document.head` node tree to HTML |
+| `PrerenderResult` | `{ rendered: string[]; failed: Array<{ route: string; error: string }>; elapsedMs: number }`. `rendered` includes `404.html` and entries labelled `(shell)` |
+| `HeadNode` | Re-exported from `bini-router` |
 
 ---
 
 ## Hosting notes
 
-- Static hosts serve `about/index.html` for `/about` out of the box, so pre-rendered routes and crawled dynamic URLs work without extra configuration.
-- Shell pages live in literal `[param]` directories (for example `/blog/[slug]/index.html`). Hosts won't map `/blog/some-post` onto that path by themselves — add a rewrite or SPA-fallback rule for those patterns on your platform.
-- Use `fallback: true` for hosts that look for a top-level `404.html`.
+- Static hosts serve `about/index.html` for `/about`, so pre-rendered and crawled routes work without extra configuration.
+- URLs that were never rendered (a blog slug no page links to, for example) have no file. Add a rewrite or SPA fallback for those patterns on your host, or link to them from a rendered page.
+- Use the generated `404.html` on hosts that look for a top-level 404 file.
+- Injected route CSS links are root-absolute, so deployments under a sub-path need the CSS tags checked.
 
 ---
 
 ## Troubleshooting
 
-**`Failed to load bini-router manifest`** — `bini-router` isn't installed or resolvable, or it threw while scanning `appDir`. Check that `appDir` points at your routes directory.
+**`SSR bundle not found at …`**
+The SSR build hasn't run. Run `vite build --ssr src/main.tsx` after `vite build`.
 
-**`File … must export a render(url) function`** — `src/main.*` loaded but has no `render` export. Add it as described in [Implementing `render()`](#implementing-render).
+**`dist/index.html not found`**
+The client build hasn't run, or it ran after the SSR build and replaced the output. Run `vite build` first.
 
-**`Failed to load …/src/main.tsx`** — an import in your entry failed under Node. Confirm `tsx` is installed and check that module-scope code doesn't rely on browser globals or `import.meta.env`.
+**`has no element with id="root"`**
+The template needs `<div id="root"></div>`.
 
-**Hydration error #418 on a page** — the page is a shell (or a fallback from a failed `render()`), but the client called `hydrateRoot`. Make sure your entry checks `window.__BINI_SHELL__` before choosing between `createRoot` and `hydrateRoot`.
+**`SSR bundle does not export render()`**
+Your entry has no `render` export. See [Implementing `render()`](#implementing-render).
 
-**A route unexpectedly rendered as a shell** — `render()` threw for that URL, and the plugin silently fell back. Call `render('/that-route')` directly in a script to see the error.
+**`failed to load the SSR bundle`**
+An import in your entry failed in Node. Check module-scope code that touches `window`, `document`, or browser-only libraries.
 
-**A dynamic URL wasn't pre-rendered** — no rendered page links to it, or the link exists only after client-side fetching. Link to it from a statically rendered page, or accept the shell fallback.
+**Hydration error #418 on a page**
+The page is a shell (or a fallback from a failed `render()`), but the client called `hydrateRoot`. Check `window.__BINI_SHELL__` before choosing between `createRoot` and `hydrateRoot`.
 
-**Expected metadata or a route-scoped stylesheet is missing from a page** — metadata/CSS injection is best-effort and silently skipped if `bini-router` throws while resolving it for that route, or if a source CSS path can't be matched to a hashed build output. Verify `getMetadataForRoute`/`getCssForRoute` return what you expect for that route directly.
+**A route unexpectedly rendered as a shell**
+`render()` threw, returned a non-string, hit a loader redirect, or got a status of 500 or more from a loader, and the plugin fell back silently. Call `render('/that-route')` from a script to see the error.
 
-**Build succeeds but the process seems to stop early** — see the note on `process.exit(0)` under [Node runtime details](#node-runtime-details).
+**A dynamic URL wasn't pre-rendered**
+No rendered page links to it, or the link only exists after client-side fetching. Link to it from a statically rendered page.
+
+**Expected metadata or route CSS is missing**
+Metadata and CSS lookups are skipped if `bini-router` throws for that route. CSS is also skipped when `css-map.json` is missing or a source path can't be matched to a hashed file. Check `getMetadataForRoute` and `getCssForRoute` for that route directly.
+
+**`No .bini/css-map.json found`**
+The client build didn't emit the CSS map, or `dist/.bini` was deleted between the two builds.
+
+**Output ended up in the wrong folder**
+The pre-render step is fixed to `dist/`. Reset `build.outDir` to the default.
 
 ---
 

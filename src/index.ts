@@ -38,7 +38,7 @@ const CONCURRENCY = 1
 const CRAWL_DEPTH = Infinity
 const FAIL_ON_ERROR = true
 const GENERATE_404 = true
-const CLEANUP_SSR = true
+const CLEANUP_SSR = false
 const MINIFY = true
 const INCLUDE_ROOT = true
 
@@ -351,12 +351,6 @@ function applyHead(
       const firstUrl = typeof first === 'string' ? first : str((first as Record<string, unknown> | undefined)?.url)
       if (firstUrl) ensureMeta('twitter:image', firstUrl)
     }
-
-    const headNodes = meta.document?.head
-    if (Array.isArray(headNodes) && headNodes.length > 0) {
-      const headHtml = headTreeToHtml(headNodes as HeadNode[])
-      if (headHtml) head.insertAdjacentHTML('beforeend', headHtml)
-    }
   }
 
   const documentConfig = meta?.document
@@ -388,6 +382,71 @@ function applyHead(
   }
 
   if (head && shell) head.insertAdjacentHTML('beforeend', SHELL_MARKER_SCRIPT)
+}
+
+const HOISTABLE_TAGS = new Set(['title', 'meta', 'link'])
+const HOISTABLE_SCRIPT_TYPE = 'application/ld+json'
+
+function hoistKey(el: any): string {
+  const tag = String(el.rawTagName ?? el.tagName ?? '').toLowerCase()
+  if (tag === 'title') return 'title'
+  if (tag === 'meta') {
+    const name = el.getAttribute('name')
+    const property = el.getAttribute('property')
+    const httpEquiv = el.getAttribute('http-equiv')
+    const charset = el.getAttribute('charset')
+    const id = el.getAttribute('id')
+    const key = name ?? property ?? httpEquiv ?? charset ?? id
+    return key ? `meta:${key.toLowerCase()}` : `meta:anon:${Math.random()}`
+  }
+  if (tag === 'link') {
+    const rel = (el.getAttribute('rel') ?? '').toLowerCase()
+    const href = el.getAttribute('href') ?? ''
+    return `link:${rel}:${href}`
+  }
+  if (tag === 'script' && el.getAttribute('type') === HOISTABLE_SCRIPT_TYPE) {
+    const body = String(el.innerHTML ?? el.textContent ?? '').trim()
+    return `script:${HOISTABLE_SCRIPT_TYPE}:${body.slice(0, 64)}`
+  }
+  return `${tag}:${Math.random()}`
+}
+
+function hoistHeadTags(html: string, doc: ReturnType<typeof parse>): string {
+  const rendered = parse(html, { comment: true })
+  const head = doc.querySelector('head')
+  if (!head) return html
+
+  const collected: any[] = []
+  for (const tag of HOISTABLE_TAGS) {
+    collected.push(...rendered.querySelectorAll(tag))
+  }
+  const scripts = rendered
+    .querySelectorAll('script')
+    .filter((s: any) => s.getAttribute('type') === HOISTABLE_SCRIPT_TYPE)
+  collected.push(...scripts)
+
+  const seen = new Map<string, any>()
+  for (const el of collected) {
+    const key = hoistKey(el)
+    const prev = seen.get(key)
+    if (prev && prev !== el) {
+      prev.remove()
+    }
+    seen.set(key, el)
+  }
+
+  for (const [key, el] of seen) {
+    const existingInHead = head
+      .querySelectorAll('title, meta, link')
+      .find((h: any) => hoistKey(h) === key)
+    if (existingInHead) existingInHead.remove()
+
+    const outer = el.outerHTML
+    el.remove()
+    head.insertAdjacentHTML('beforeend', outer)
+  }
+
+  return rendered.toString()
 }
 
 function extractInternalLinks(html: string): string[] {
@@ -447,6 +506,7 @@ async function minifyHtml(html: string): Promise<string> {
     useShortDoctype: true,
     minifyCSS: true,
     minifyJS: true,
+    processScripts: ['text/javascript', 'application/javascript', 'module'],
   })
 }
 
@@ -573,8 +633,6 @@ export async function prerender(): Promise<PrerenderResult> {
   let html404 = null as string | null
 
   const buildPage = (route: string, appHtml: string, shell: boolean): string => {
-    const doc = parse(templateWithMarker, { comment: true, voidTag: { closingSlash: true } })
-
     let meta: RouteManifestEntry | null = null
     let cssUrls: string[] = []
     try {
@@ -589,14 +647,29 @@ export async function prerender(): Promise<PrerenderResult> {
       // best-effort enrichments
     }
 
+    const doc = parse(templateWithMarker, { comment: true, voidTag: { closingSlash: true } })
+
     applyHead(doc, meta, cssUrls, shell)
-    return doc.toString().replace(ROOT_MARKER, () => appHtml)
+
+    const hoisted = hoistHeadTags(appHtml, doc)
+
+    let result = doc.toString().replace(ROOT_MARKER, () => hoisted)
+
+    const documentHeadHtml = meta?.document?.head && meta.document.head.length > 0
+      ? headTreeToHtml(meta.document.head as HeadNode[])
+      : ''
+    if (documentHeadHtml) {
+      result = result.replace(/<\/head>/i, `${documentHeadHtml}</head>`)
+    }
+
+    return result
   }
 
   const writePage = async (route: string, html: string): Promise<string> => {
     const file = routeToOutputPath(outDir, route)
     await fs.mkdir(path.dirname(file), { recursive: true })
-    await fs.writeFile(file, MINIFY ? await minifyHtml(html) : html)
+    const out = MINIFY ? await minifyHtml(html) : html
+    await fs.writeFile(file, out)
     return file
   }
 
@@ -610,10 +683,19 @@ export async function prerender(): Promise<PrerenderResult> {
       let shell = false
       try {
         const result = await ssr.render(route)
-        if (typeof result !== 'string') throw new Error(`render() returned ${typeof result}, expected a string`)
+        if (typeof result !== 'string') {
+          throw new Error(`render() returned ${typeof result}, expected a string`)
+        }
+        if (result.trim() === '') {
+          throw new Error('render() returned an empty string')
+        }
         appHtml = result
-      } catch {
+      } catch (error) {
         shell = true
+        const msg = errorMessage(error)
+        failed.push({ route, error: `render() failed: ${msg}` })
+        log.fail(route, `render() failed: ${msg}`)
+        return
       }
 
       try {
@@ -710,10 +792,10 @@ export async function prerender(): Promise<PrerenderResult> {
 
   if (failed.length > 0) {
     log.blank()
-    console.error(`${colors.red}${colors.bold}FAILED${colors.reset} ${failed.length} route(s) could not be written to disk:`)
+    console.error(`${colors.red}${colors.bold}FAILED${colors.reset} ${failed.length} route(s) could not be prerendered:`)
     for (const f of failed) console.error(`  ${colors.red}✗${colors.reset} ${f.route}\n    ${f.error}`)
     if (FAIL_ON_ERROR) {
-      throw new Error(`Bini SSG: ${failed.length} route(s) failed to write (${failed.map((f) => f.route).join(', ')})`)
+      throw new Error(`Bini SSG: ${failed.length} route(s) failed to prerender (${failed.map((f) => f.route).join(', ')})`)
     }
   }
 
